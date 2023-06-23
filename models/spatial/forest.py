@@ -1,0 +1,2 @@
+class ForestBlockSpace():
+    pass
