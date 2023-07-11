@@ -4,9 +4,18 @@
 @brief  Camera trajectory/paths generation tools
 """
 
+__all__ = [
+    "get_path_spherical_spiral", 
+    "get_path_spherical_spiral_extend_half", 
+    "get_path_small_circle", 
+    "get_path_front_left_lift_then_spiral_forward", 
+    "get_path_interpolation"
+]
+
 import math
 import numpy as np
-from typing import Literal
+from numbers import Number
+from typing import Literal, Union
 
 from scipy import interpolate
 from scipy.spatial.transform import Slerp
@@ -19,7 +28,7 @@ from nr3d_lib.utils import check_to_torch
 from nr3d_lib.geometry import normalize, look_at_opencv
 
 
-def smoothed_motion_interpolation(full_range, num_samples, uniform_proportion=1/3.):
+def _smoothed_motion_interpolation(full_range, num_samples, uniform_proportion=1/3.):
     half_acc_proportion = (1-uniform_proportion) / 2.
     num_uniform_acc = max(math.ceil(num_samples*half_acc_proportion), 2)
     num_uniform = max(math.ceil(num_samples*uniform_proportion), 2)
@@ -42,10 +51,11 @@ def get_path_spherical_spiral(
     three_cam_centers_ref: np.ndarray, # [3, 3] Three camera locations on a small circle for reference, CCW order
     num_frames: int, # Number of frames / waypoints to generate
     n_rots: float = 2.2, # Number of spins / rotation rounds
-    up_angle: float = np.pi / 3.,  # Extend of spiral lift angle (rad)
-    focus_center_choice: Literal['origin', 'small_circle_center'] = 'origin', 
+    up_angle_start: float = 0., # The starting lift angle (in rad)
+    up_angle: float = np.pi / 3.,  # The ending lift angle (in rad)
+    focus_center: Union[Literal['origin', 'small_circle_center'], np.ndarray, Number] = 'origin', 
     verbose=False, **verbose_kwargs
-    ):
+    ) -> np.ndarray:
     """
     https://en.wikipedia.org/wiki/Spiral#Spherical_spirals
         assume three input views are on a small circle, then generate a spherical spiral path based on the small circle
@@ -61,16 +71,23 @@ def get_path_spherical_spiral(
     
     # Key rotations of a spherical spiral path
     sphere_thetas = np.linspace(0, np.pi * 2. * n_rots, num_frames)
-    sphere_phis = np.linspace(0, up_angle, num_frames)
+    sphere_phis = np.linspace(up_angle_start, up_angle, num_frames)
     
-    if focus_center_choice == 'origin':
-        # Use the origin as the focus center
-        focus_center = np.zeros([3])
-    elif focus_center_choice == 'small_circle_center':
-        # Use the center of the small circle as the focus center
-        focus_center = np.dot(up_vec, centers[0]) * up_vec
+    if isinstance(focus_center, str):
+        if focus_center == 'origin':
+            # Use the origin as the focus center
+            focus_center = np.zeros([3])
+        elif focus_center == 'small_circle_center':
+            # Use the center of the small circle as the focus center
+            focus_center = np.dot(up_vec, centers[0]) * up_vec
+        else:
+            raise RuntimeError(f"Invalid focus_center={focus_center}")
+    elif isinstance(focus_center, Number):
+        # A height vertically lifted from the center of the small circle
+        focus_center = focus_center * up_vec
     else:
-        raise RuntimeError(f"Invalid focus_center_choice={focus_center_choice}")
+        # A absolute coordinate
+        focus_center = np.asarray(focus_center)
     
     # First rotate about up vec
     rots_theta = R.from_rotvec(sphere_thetas[:, None] * up_vec[None, :])
@@ -146,7 +163,7 @@ def get_path_small_circle(
     three_cam_centers_ref: np.ndarray, # [3, 3] Three camera locations on a small circle for reference, CCW order
     num_frames: int, # Number of frames / waypoints to generate
     verbose=False, **verbose_kwargs
-    ):
+    ) -> np.array:
     centers = three_cam_centers_ref
     centers_norm = np.linalg.norm(centers, axis=-1)
     radius = np.max(centers_norm)
@@ -160,7 +177,7 @@ def get_path_small_circle(
     # angle of the smaller arc between c0 and c1
     full_angle = np.arcsin(len_chord/2/radius) * 2.
     
-    all_angles = smoothed_motion_interpolation(full_angle, num_frames)
+    all_angles = _smoothed_motion_interpolation(full_angle, num_frames)
     
     rots = R.from_rotvec(all_angles[:, None] * up_vec[None, :])
     centers = rots.apply(centers[0])
@@ -220,16 +237,16 @@ def get_path_small_circle(
     
     return render_c2ws_all
 
-def get_path_spiral_forward_after_front_left_lift(
-    pose_ref: np.ndarray, # [N,4,4], Original ego pose; will generate trajectories along this
+def get_path_front_left_lift_then_spiral_forward(
+    pose_ref: np.ndarray, # [N0,4,4], Original ego pose; will generate trajectories along this
     num_frames: int, # Number of frames / waypoints to generate
-    duration_frames: int, # Number of frames per round / cycle
+    duration_frames: int = 48, # Number of frames per round / cycle
     # Spiral configs
     up_max: float = 2.5, up_offset: float = 1.0, left_max: float = 2.5, left_offset: float = -1.2, elongation: float = 1., 
     front_vec: np.ndarray = np.array([1., 0., 0.]),  # Frontal direction vector
     up_vec: np.ndarray = np.array([0., 0., 1.]),  # Frontal direction vector
     left_vec: np.ndarray = np.array([0., 1., 0.]),  # Frontal direction vector
-    ):
+    ) -> np.ndarray:
     """
     First lift ego in the front left direction, then do spiral forward
     """
@@ -306,4 +323,26 @@ def get_path_spiral_forward_after_front_left_lift(
     nvs_seqs.append(pose)
     
     render_pose_all = np.concatenate(nvs_seqs, 0)
+    return render_pose_all
+
+def get_path_interpolation(
+    pose_ref: np.ndarray, # [N0,4,4], Original ego pose; will generate trajectories along this
+    num_frames: int, # Number of frames / waypoints to generate
+    ) -> np.ndarray:
+    key_rots = R.from_matrix(pose_ref[:, :3, :3])
+    key_trans = pose_ref[:, :3, 3]
+    key_times = list(range(len(key_rots)))
+    slerp = Slerp(key_times, key_rots) # Rotation interpolation
+    interp = interpolate.interp1d(key_times, key_trans, axis=0) # Translation interpolation
+    
+    render_pose_all = []
+    for i, time in enumerate(np.linspace(0, len(pose_ref)-1, num_frames)):
+        cam_location = interp(time)
+        cam_rot = slerp(time).as_matrix()
+        c2w = np.eye(4)
+        c2w[:3, :3] = cam_rot
+        c2w[:3, 3] = cam_location
+        render_pose_all.append(c2w)
+    
+    render_pose_all = np.array(render_pose_all)
     return render_pose_all

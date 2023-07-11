@@ -83,11 +83,11 @@ class BaseConfig:
             When merging different sources of configs, the priorty orders are:
                 Command line dotlist params  --over-->  command line argparse params  --over-->  "--config" config yaml  --over-->  base_config_path config yaml
 
-            Command line dotlist params are supported for more customized specification. 
-            For example, if you have {"training": {"optim": {"lr": 0.01}}} in your config yaml file named "xxx.yaml", 
-                you can specify "--training.optim.lr=0.1" or "training.optim.lr=0.1" after "--config xxx.yaml" to overwrite configs in yaml.
-            For more details, check the original documentation of OmegaConf:
-                https://omegaconf.readthedocs.io/en/2.1_branch/usage.html#from-a-dot-list
+            Dot-list command-line params are supported for more customized specification. 
+                For example, if you have {"training": {"optim": {"lr": 0.01}}} in your config yaml file named "xxx.yaml", 
+                    you can specify "--training.optim.lr=0.1" or "training.optim.lr=0.1" after "--config xxx.yaml" to overwrite configs in yaml.
+                For more details, check the original documentation of OmegaConf:
+                    https://omegaconf.readthedocs.io/en/2.1_branch/usage.html#from-a-dot-list
 
         Args:
             manual_cli_args (Sequence[str], optional): Manually given command line args to parse (bypass sys.argv). Defaults to None.
@@ -117,16 +117,18 @@ class BaseConfig:
             base_config = OmegaConf.create()
             config = OmegaConf.load(os.path.join(resume_dir, 'config.yaml'))
 
-            # use the loading directory as the experiment path
+            # Use the loading directory as the experiment path
             config.exp_dir = resume_dir
             print(f"=> Loading previous experiments in: {config.exp_dir}")
         else:
             if base_config_path is not None:
+                assert os.path.exists(base_config_path), f"`base_config_path` not exist: {base_config_path}"
                 base_config = OmegaConf.load(base_config_path)
             else:
                 base_config = OmegaConf.create()
 
             if config_path is not None:
+                assert os.path.exists(config_path), f"`config` not exist: {config_path}"
                 config = OmegaConf.load(config_path)
                 assert (not stand_alone) or 'exp_dir' in config, 'Please specify exp_dir in task_config'
             elif stand_alone:
@@ -162,20 +164,42 @@ class BaseConfig:
 
         """
         Interpolate omegaconf at last
+        
+        NOTE: (1) Since config interpolation is performed after merging configs, 
+            it's possible to use command line args to overwrite the keys that are used to interpolate in config yaml.
+            
+            For example if you have a config yaml:
+                ```yaml
+                some_config: 
+                  param_a:
+                    subparam_1: 20.0
+                  param_b:
+                    word: hello_world
+                some_other_config:
+                  param_c: ${some_config.param_a.subparam_1}
+                ```
+            
+            You can change the value of `some_config.param_a.subparam_1` in command line, 
+                    (e.g. --some_config.param_a.subparam_1=30.0 )
+                which will also affect the value of `some_other_config.param_c`
+        
+        NOTE: (2) Since OmegaConf's runtime interpolation is of VERY high temporal cost,
+            it's important to use the interpolated dict object in training or rendering, rather than the original OmageConf object
+            
+            For example, codes like `for k,v in cfg.items()` or `if 'foo' in cfg` can take more than 1ms to evaluate, 
+                while simple dicts take only take less than a few microseconds.
+            
+            `for k,v in cfg.items()` benchmark time for 10000 iters:
+                omegaconf 0.5495906309224665
+                dict 0.0025583491660654545
+                addict 0.008531622588634491
+                easydict 0.002534216269850731
+            
+            Hence, we choose `addict` because:
+                1. `.` attribute access
+                2. set new attr
+                3. although slower than dict/easydict, it's acceptable and much faster than Omageconf
         """
-        # NOTE: 
-        # !!! Important! OmegaConf's runtime interpolation support is of VERY high cost;
-        #       e.g. codes like `for k,v in cfg.items()` or `if 'foo' in cfg` can take more than 1ms to evaluate, 
-        #           while simple dicts take only take less than a few microseconds.
-        #       `for k,v in cfg.items()` evalute time for 10000 iters:
-        #           omegaconf 0.5495906309224665
-        #           dict 0.0025583491660654545
-        #           addict 0.008531622588634491
-        #           easydict 0.002534216269850731
-        #       Hence, we convert to `addict` for:
-        #           1. `.` attribute access
-        #           2. set new attr
-        #           3. although slower than dict/easydict, it's acceptable and much faster than Omageconf
         config = ConfigDict(OmegaConf.to_container(config, resolve=True))
         return config
 

@@ -27,7 +27,7 @@ Previous point    Point extending    Current point    Point extending     Next p
 
 
 However, in practice, nablas of multires-grid-based representations are often much wilder than original MLPs, \
-    bringing a lot of noise to the estimation and unstablize training.
+    which brings a lot of noise to the estimation and unstablizes training.
 
 Hence, in our implementation, we first query interval boundaries' SDF to calculate alphas, \
     then query middle points' color and nablas for rendering.
@@ -161,14 +161,14 @@ class neus_renderer_mixin:
         assert (rays_o.dim() == 2) and (rays_d.dim() == 2), "Expect rays_o and rays_d to be of shape [N, 3]"
         return self.space.ray_test(rays_o, rays_d, near=near, far=far, return_rays=True, **extra_ray_shaped)
 
-    def _ray_query_only_raymarch(
-    ):
+    def _ray_query_march_occ(
+        ):
         """
         NGP's ray query mode
         """
         pass
     
-    def _ray_query_coarse_batchup(
+    def _ray_query_coarse_multi_upsample(
         self, ray_tested: Dict[str, torch.Tensor], *, 
         # Common params
         with_rgb: bool = True, with_normal: bool = True, 
@@ -179,7 +179,7 @@ class neus_renderer_mixin:
         upsample_inv_s: float = 64., upsample_mode: str = 'multistep_estimate', num_fine: int = 64, 
         upsample_inv_s_factors: List[int] = [1, 2, 4, 8], upsample_use_estimate_alpha=False,  # For upsample_mode = multistep_estimate
         num_nograd: int = 1024, chunksize_query: int = 2**24 # For upsample_mode = direct_more
-    ):
+        ):
         """
         Vanilla NeuS ray query mode
         """
@@ -327,7 +327,7 @@ class neus_renderer_mixin:
             volume_buffer['details'] = {'render.num_per_ray': d_mid.shape[-1]}
             return volume_buffer
 
-    def _ray_query_raymarch_batchup_jianfei(
+    def _ray_query_march_occ_multi_upsample(
         self, ray_tested: Dict[str, torch.Tensor], 
         # Common params
         with_rgb: bool = True, with_normal: bool = True, 
@@ -337,7 +337,12 @@ class neus_renderer_mixin:
         chunksize_query: int = 2**24, march_cfg = ConfigDict(), num_fine: int = 8, 
         upsample_inv_s: float = 64., upsample_inv_s_factors: List[int] = [1, 4, 16], upsample_use_estimate_alpha=False
         # with_near_sdf = ..., depth_use_normalized_vw = ..., query_mode = ..., near = ..., far = ..., with_env = ..., rayschunk = ...
-    ):
+        ):
+        """
+        Multi-stage upsampling on marched samples of occupancy grids (without reduction/compression of meaningless samples)
+        Introduced in StreetSurf Section 4.1
+        https://arxiv.org/abs/2306.04988
+        """
         assert self.accel is not None, "Need a non-empty AccelStruct"
         
         upsample_inv_s /= self.upsample_s_divisor
@@ -570,7 +575,7 @@ class neus_renderer_mixin:
                 return volume_buffer
 
     # @profile
-    def _ray_query_raymarch_batchup_compression_jianfei(
+    def _ray_query_march_occ_multi_upsample_compressed(
         self, ray_tested: Dict[str, torch.Tensor], *, 
         # Common params
         with_rgb: bool = True, with_normal: bool = True, 
@@ -579,7 +584,13 @@ class neus_renderer_mixin:
         num_coarse: int = 0, coarse_step_cfg = ConfigDict(step_mode='linear'), 
         chunksize_query: int = 2**24,  march_cfg = ConfigDict(), num_fine: int = 8, 
         upsample_inv_s: float = 64., upsample_inv_s_factors: List[int] = [1, 4, 16], upsample_use_estimate_alpha=False
-    ):
+        ):
+        """
+        Multi-stage upsampling on marched samples of occupancy grids (with reduction/compression of meaningless samples)
+        Introduced in StreetSurf Section 4.1
+        https://arxiv.org/abs/2306.04988
+        """
+        
         assert self.accel is not None, "Need a non-empty AccelStruct"
         
         if isinstance(num_fine, int):
@@ -841,7 +852,7 @@ class neus_renderer_mixin:
                     volume_buffer['details'] = {'render.num_per_ray0': num_coarse, 'render.num_per_ray': pack_infos_hit_useful[:, 1]}
                     return volume_buffer
 
-    def _ray_query_raymarch_batchup_compression_time_var_jianfei(
+    def _ray_query_march_occ_multi_upsample_compressed_strategy(
         self, ray_tested: Dict[str, torch.Tensor], 
         # Common params
         with_rgb: bool = True, with_normal: bool = True, 
@@ -870,7 +881,7 @@ class neus_renderer_mixin:
         #     num_coarse = 16
         #     num_fine = 8
         #     upsample_inv_s_factors = [1., 4., 16.]
-        # return self._ray_query_raymarch_batchup_compression_jianfei(
+        # return self._ray_query_march_occ_multi_upsample_compressed(
         #     ray_tested, with_rgb=with_rgb, with_normal=with_normal,
         #     perturb=perturb, nablas_has_grad=nablas_has_grad, forward_inv_s=forward_inv_s, 
         #     num_coarse=num_coarse, coarse_step_cfg=coarse_step_cfg, 
@@ -889,7 +900,7 @@ class neus_renderer_mixin:
         # function config
         return_buffer=False, return_details=False, render_per_obj=False) -> dict:
         """ Query the model with input rays. 
-            Conduct the core ray sampling, ray marching, ray upsampling and network query procudures.
+            Conduct the core logic of ray sampling, ray marching and network query procedures.
 
         Args:
             ray_input (Dict[str, torch.Tensor], optional): All input rays. A dict composed of:
@@ -910,8 +921,11 @@ class neus_renderer_mixin:
             render_per_obj (bool, optional): If return single object / seperate volume rendering results. Defaults to False.
 
         Returns:
-            dict: The queried volume_buffer.
-                For now, two types of buffers might be queried depending on the ray sampling algorithms, namely `batched` buffers and `packed` buffers.
+            nested dict, The queried results, including 'volume_buffer', 'details', 'rendered'.
+            
+            ['volume_buffer'] dict, The queried volume buffer. Available if `return_buffer` is set True.
+                For now, two types of buffers might be queried depending on the ray sampling algorithms, 
+                    namely `batched` buffers and `packed` buffers.
                 
                 If there are no tested rays or no hit rays, the returned buffer is empty:
                     'volume_buffer" {'type': 'empty'}
@@ -937,6 +951,17 @@ class neus_renderer_mixin:
                         'rgb':              [num_packed_samples] packed tensor, optional, the queried rgb values
                         'nablas':           [num_packed_samples] packed tensor, optional, the queried nablas values
                         'feature':          [num_packed_samples] packed tensor, optional, the queried features
+                    }
+            
+            ['details'] nested dict, Details for training. Available if `return_details` is set True.
+            
+            ['rendered'] dict, stand-alone rendered results. Available if `render_per_obj` is set True.
+                An example rendered dict:
+                    'rendered' {
+                        'mask_volume':      [num_total_rays,] The rendered opacity / occupancy, in range [0,1]
+                        'depth_volume':     [num_total_rays,] The rendered real depth
+                        'rgb_volume':       [num_total_rays, 3] The rendered rgb, in range [0,1]
+                        'normals_volume':   [num_total_rays, 3] The rendered normals, in range [-1,1]
                     }
         """
         
@@ -990,23 +1015,23 @@ class neus_renderer_mixin:
         # Ray query
         #----------------
         if query_mode == 'raymarch+batchup+jianfei':
-            volume_buffer = self._ray_query_raymarch_batchup_jianfei(
+            volume_buffer = self._ray_query_march_occ_multi_upsample(
                 ray_tested, with_rgb=with_rgb, with_normal=with_normal, 
                 perturb=config.perturb, forward_inv_s=forward_inv_s, **config.query_param)
         elif query_mode == 'raymarch+batchup+compression+jianfei':
-            volume_buffer = self._ray_query_raymarch_batchup_compression_jianfei(
+            volume_buffer = self._ray_query_march_occ_multi_upsample_compressed(
                 ray_tested, with_rgb=with_rgb, with_normal=with_normal, 
                 perturb=config.perturb, forward_inv_s=forward_inv_s, **config.query_param)
         elif query_mode == 'raymarch+batchup+compression+timevar+jianfei':
-            volume_buffer = self._ray_query_raymarch_batchup_compression_time_var_jianfei(
+            volume_buffer = self._ray_query_march_occ_multi_upsample_compressed_strategy(
                 ray_tested, with_rgb=with_rgb, with_normal=with_normal, 
                 perturb=config.perturb, forward_inv_s=forward_inv_s, **config.query_param)
         elif query_mode == 'coarse+batchup':
-            volume_buffer = self._ray_query_coarse_batchup(
+            volume_buffer = self._ray_query_coarse_multi_upsample(
                 ray_tested, with_rgb=with_rgb, with_normal=with_normal, 
                 perturb=config.perturb, forward_inv_s=forward_inv_s, **config.query_param)
         elif query_mode == 'only_raymarch':
-            volume_buffer = self._ray_query_only_raymarch(
+            volume_buffer = self._ray_query_march_occ(
                 ray_tested, with_rgb=with_rgb, with_normal=with_normal, 
                 perturb=config.perturb, forward_inv_s=forward_inv_s, **config.query_param)
         else:

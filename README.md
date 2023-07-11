@@ -4,19 +4,26 @@
 
 Modules, operators and utilities for 3D neural rendering in single-object, multi-object, categorical and large-scale scenes.
 
-Pull requests and collaborations are warmly welcomed :hugs:!  
+Pull requests and collaborations are warmly welcomed :hugs:! Please follow our code style if you want to make any contribution.
 
-Feel free to open an issue or contact [Jianfei Guo](https://ventusff.github.io/) at guojianfei@pjlab.org.cn or ffventus@gmail.com if you have any questions or proposals.
+Feel free to open an issue or contact [Jianfei Guo](https://ventusff.github.io/) at ffventus@gmail.com if you have any questions or proposals.
 
 ## Installation
 
 ### Requirements
 
 - python >= 3.8
-- Pytorch >= 1.10 && Pytorch!=1.12
-- [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit-archive) >= 10.0
+- Pytorch >= 1.10 && !=1.12 && <2.0
+- [CUDA dev](https://developer.nvidia.com/cuda-toolkit-archive) >= 10.0
   - need to match the major CUDA version that your Pytorch built with
 
+An example of our platform (python=3.8, pytorch=1.11, cuda=11.3 / 11.7): 
+
+```shell
+conda create -n nr3d python=3.8
+conda activate nr3d
+conda install pytorch==1.11.0 torchvision==0.12.0 torchaudio==0.11.0 cudatoolkit=11.3 -c pytorch
+```
 
 - pytorch_scatter
 
@@ -27,7 +34,7 @@ conda install pytorch-scatter -c pyg
 - other pip packages
 
 ```shell
-pip install opencv-python-headless kornia imagesize omegaconf addict imageio imageio-ffmpeg scikit-image scikit-learn pyyaml pynvml seaborn trimesh plyfile ninja icecream tqdm plyfile tensorboard
+pip install opencv-python-headless kornia imagesize omegaconf addict imageio imageio-ffmpeg scikit-image scikit-learn pyyaml pynvml psutil seaborn==0.12.0 trimesh plyfile ninja icecream tqdm plyfile tensorboard
 ```
 
 ### One-liner install
@@ -44,7 +51,7 @@ pip install -v .
 - Visualization
 
 
-  - `pip install open3d vedo mayavi`
+  - `pip install open3d vedo==2023.4.6 mayavi`
 
 - tiny-cuda-nn backends
 
@@ -71,7 +78,6 @@ pip install -v .
     python setup.py install
     ```
 
-
 </details>
 
 ## Main components
@@ -85,29 +91,21 @@ pip install -v .
 ### :pushpin: [LoTD]: Levels of Tensorial Decomposition <a name="lotd"></a>
 
 - Code: [models/grids/lotd](models/grids/lotd)
-
-- Supported Scene
+- Supported scenes: 
 
   - [x] Single scene
 
   - [x] Batched / categorical scene;  (LoTD-Growers to be released in Aug. 2023)
 
   - [ ] Large-scale scene (To be released: Sept. 2023)
-
 - Main feature
 
-  - All types support **cuboid resolutions**
-
-  - All types support forward, first-order gradients and **second-order gradients**
-
   - Support **different layer using different types**
-
-  - All types other than hash support **batched encoding**
-
-  - (To be released) all types support large-scale representation
-
   - Support different layer using **different widths (n_feats)**
-
+  - All types support **cuboid resolutions**
+  - All types support forward, first-order gradients and **second-order gradients**
+  - All types support **batched encoding**: inference with batched inputs or batch_inds
+  - [To be released] All types support large-scale scene representation
 - Supported LoTD Types and calculations of forward, gradients (`dLd[]`) and second-order gradients (`d(dLdx)d[]`)
 
 | :rocket: All implemented with Pytorch-CUDA extension         | dimension | forward            | dL<br />dparam     | dL<br />dx         | d(dLdx)<br />d(param) | d(dLdx)<br />d(dLdy) | d(dLdx)<br />dx    |
@@ -115,7 +113,7 @@ pip install -v .
 | `Dense`                                                      | 2-4       | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
 | `Hash`<br />hash-grids in [NGP](https://github.com/NVlabs/instant-ngp) | 2-4       | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
 | `VectorMatrix` or `VM`<br />Vector-Matrix in [TensoRF](https://apchenstu.github.io/TensoRF/) | 3         | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
-| `VecZMatXoY`<br />modified from [TensoRF](https://apchenstu.github.io/TensoRF/) | 3         | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
+| `VecZMatXoY`<br />modified from [TensoRF](https://apchenstu.github.io/TensoRF/)<br />using only `xoy` mat and `z` vector. | 3         | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
 | `CP`<br />CP in [TensoRF](https://apchenstu.github.io/TensoRF/) | 2-4       | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
 | `NPlaneSum`<br />"TriPlane" in [EG3D](https://nvlabs.github.io/eg3d/) | 3-4       | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
 | `NPlaneMul`                                                  | 3-4       | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark:    | :white_check_mark:   | :white_check_mark: |
@@ -124,7 +122,7 @@ pip install -v .
 
 ```yaml
 lod_res:     [32,    64,    128, 256, 512, 1024, 2048, 4096]
-lod_n_feats: [4,     4,     4,   4,   4,   16,    8,    4]
+lod_n_feats: [4,     4,     8,   4,   2,   16,    8,    4]
 lod_types:   [Dense, Dense, VM,  VM,  VM,  CP,   CP,   CP]
 ```
 
@@ -147,19 +145,23 @@ Code: [render/pack_ops](render/pack_ops)
 
 ### :pushpin: [occ_grids] Occupancy accelerates ray marching <a name="occ_grids"></a>
 
-Code: [models/spatial_accel/occgrid.py](models/spatial_accel/occgrid.py)    [render/raymarch/occgrid_raymarch.py](render/raymarch/occgrid_raymarch.py)
+Code: [render/raymarch/occgrid_raymarch.py](render/raymarch/occgrid_raymarch.py)
 
 This part is primarily borrowed and modified from [nerfacc](https://github.com/KAIR-BAIR/nerfacc/tree/master/nerfacc)
 
-- Supported Scene
-
-  - [x] Single scene
-
-
-  - [ ] Batched / categorical scene;  (To be released: Aug. 2023)
+- [x] Support single scene
+- [x] Support batched / categorical scene
+- [ ] Support large-scale scene (To be released: Sept. 2023)
 
 
-  - [ ] Large-scale scene (To be released: Sept. 2023)
+#### Highlight implementations
+
+- Efficient multi-stage hierarchical ray marching on occupancy grids
+  - introduced in [StreetSurf](https://ventusff.github.io/streetsurf_web/) paper section 4.1![multi_stage_upsample_occ](media/multi_stage_upsample_occ.png)
+  - implementation in [models/fields/neus/renderer_mixin.py](models/fields/neus/renderer_mixin.py)
+  - batched implementation in [models/fields_conditional/neus/renderer_mixin.py](models/fields_conditional/neus/renderer_mixin.py)
+  - large-scale implementation is still WIP...
+  
 
 ### :pushpin: [attributes]: Unified API framework for scene node attributes <a name="attr"></a>
 
@@ -194,11 +196,12 @@ Code: [models/fields](models/fields)
 
   - MLP-NeuS
 
+  - [models/fields/neus/renderer_mixin.py](models/fields/neus/renderer_mixin.py) Multi-stage hierarchical sampling on occupancy grids
+
 - `nerf` & `nerf_distant` (codes in [models/fields_distant](models/fields_distant))
-
-  - LoTD-NeRF/NeRF++
-
-  - MLP-NeRF/NeRF++
+- LoTD-NeRF/NeRF++
+  
+- MLP-NeRF/NeRF++
 
 #### `fields_conditional`: conditional / categorical fields
 
@@ -212,17 +215,23 @@ Code: [models/fields_forest](models/fields_forest)
 
 - [ ] To be released
 
-### Other utilities
+### Other highlights
 
 - [plot](plot)  2d & 3d plotting tools for developers
-- [models/importance.py](models/importance.py)  errormap update & 2D importance sampling (inverse 2D cdf);  modified from [NGP](https://github.com/NVlabs/instant-ngp) and re-implemented in PyTorch 
+- [models/importance.py](models/importance.py)  errormap update & 2D importance sampling (inverse 2D cdf sampling);  modified from [NGP](https://github.com/NVlabs/instant-ngp) and re-implemented in PyTorch 
 
 ## TODO
 
-- [ ] Release LoTD-Growers, batched ray marching and Style-LoTD-NeuS
-- [ ] Release large-scale representation, ray marching and large-scale neus
+- [x] Release batched ray marching
+- [ ] Release LoTD-Growers and Style-LoTD-NeuS
+- [ ] Release large-scale representation, large-scale ray marching and large-scale neus
 - [ ] Implement dmtet
 - [ ] Implement permuto-SDF
+- [ ] Basic examples & tutorials
+  - [ ] How to use single / batched / large-scale LoTD
+  - [ ] Example on batched ray marching & batched LoTD inference
+  - [ ] Example on efficient multi-stage hierarchical sampling based on occupancy grids
+
 
 ## Acknowledgements
 

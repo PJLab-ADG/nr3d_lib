@@ -1,5 +1,6 @@
 /** @file   occ_grid.cpp
- *  @brief  Occupancy grid ops.
+ *  @author Jianfei Guo, Shanghai AI Lab
+ *  @brief  Occupancy grid marching operations.
  *  Modified from https://github.com/KAIR-BAIR/nerfacc
  * 	Copyright (c) 2022 Ruilong Li, UC Berkeley.
  */
@@ -27,6 +28,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		;
 
     m.def("ray_marching", &ray_marching, "ray_marching on a single block");
-    // m.def("batched_ray_marching", &batched_ray_marching, "ray_marching on a batched of blocks");
+    m.def("batched_ray_marching", &batched_ray_marching, "ray_marching on batched blocks");
     // m.def("forest_ray_marching", &forest_ray_marching, "ray_marching on a forest of blocks");
 }

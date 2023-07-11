@@ -26,7 +26,7 @@ class dataclass_raymarch_ret:
         return iter(tuple(getattr(self, field.name) for field in fields(self)))
 
 @dataclass
-class dataclass_bathced_raymarch_ret:
+class dataclass_batched_raymarch_ret:
     # NOTE: The whole packed [num_samples, ...] elements can be seen as results of two kinds of packing:
     #       1. One pack for each hit ray
     #           ridx_hit, pack_infos

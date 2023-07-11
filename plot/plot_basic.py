@@ -207,3 +207,11 @@ def figure_to_image(figures, close=True):
     else:
         image = render_to_rgb(figures)
         return image
+
+def choose_opposite_color(bg_color: Tuple[int, int, int]):
+    # Calculate brightness and choose the opposite color based on the background color
+    brightness = (bg_color[0] * 299 + bg_color[1] * 587 + bg_color[2] * 114) / 1000
+    if brightness > 127:
+        return (0, 0, 0)
+    else:
+        return (255, 255, 255)

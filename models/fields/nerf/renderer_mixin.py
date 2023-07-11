@@ -97,7 +97,7 @@ class nerf_renderer_mixin:
         assert (rays_o.dim() == 2) and (rays_d.dim() == 2), "Expect rays_o and rays_d to be of shape [N, 3]"
         return self.space.ray_test(rays_o, rays_d, near=near, far=far, return_rays=True, **extra_ray_shaped)
 
-    def _ray_query_only_raymarch(
+    def _ray_query_march_occ(
         self, ray_tested: Dict[str, torch.Tensor], *, 
         with_rgb: bool = True, with_normal: bool = False, 
         perturb: bool = False, march_cfg=ConfigDict(), 
@@ -217,8 +217,11 @@ class nerf_renderer_mixin:
             render_per_obj (bool, optional): If return single object / seperate volume rendering results. Defaults to False.
 
         Returns:
-            dict: The queried volume_buffer.
-                For now, two types of buffers might be queried depending on the ray sampling algorithms, namely `batched` buffers and `packed` buffers.
+            nested dict, The queried results, including 'volume_buffer', 'details', 'rendered'.
+            
+            ['volume_buffer'] dict, The queried volume buffer. Available if `return_buffer` is set True.
+                For now, two types of buffers might be queried depending on the ray sampling algorithms, 
+                    namely `batched` buffers and `packed` buffers.
                 
                 If there are no tested rays or no hit rays, the returned buffer is empty:
                     'volume_buffer" {'type': 'empty'}
@@ -242,6 +245,16 @@ class nerf_renderer_mixin:
                         'opacity_alpha':    [num_packed_samples] packed tensor, the queried alpha-values
                         'rgb':              [num_packed_samples] packed tensor, optional, the queried rgb values
                         'feature':          [num_packed_samples] packed tensor, optional, the queried features
+                    }
+
+            ['details'] nested dict, Details for training. Available if `return_details` is set True.
+            
+            ['rendered'] dict, stand-alone rendered results. Available if `render_per_obj` is set True.
+                An example rendered dict:
+                    'rendered' {
+                        'mask_volume':      [num_total_rays,] The rendered opacity / occupancy, in range [0,1]
+                        'depth_volume':     [num_total_rays,] The rendered real depth
+                        'rgb_volume':       [num_total_rays, 3] The rendered rgb, in range [0,1]
                     }
         """
 
@@ -285,7 +298,7 @@ class nerf_renderer_mixin:
         # Ray query
         #----------------
         if query_mode == 'only_raymarch':
-            volume_buffer = self._ray_query_only_raymarch(
+            volume_buffer = self._ray_query_march_occ(
                 ray_tested, with_rgb=with_rgb, perturb=config.perturb, **config.query_param)
         else:
             raise RuntimeError(f"Invalid query_mode={query_mode}")

@@ -80,14 +80,13 @@ class OccupancyGridAS(nn.Module):
                     img = self.plt.screenshot(asarray=True)
                     logger.add_imgs(img, "dbg_occgrid", cur_it)
             elif updated:
-                if not self.plt.escaped:
-                    self.debug_vis_tick()
-                    # self.plt.screenshot(os.path.join(self.dbg_dir, f"{cur_it:08d}.png"))
-                    if logger is not None:
-                        img = self.plt.screenshot(asarray=True)
-                        logger.add_imgs(img, "dbg_occgrid", cur_it)
-                else:
-                    self.plt.interactive().close()
+                self.debug_vis_tick()
+                # self.plt.screenshot(os.path.join(self.dbg_dir, f"{cur_it:08d}.png"))
+                if logger is not None:
+                    img = self.plt.screenshot(asarray=True)
+                    logger.add_imgs(img, "dbg_occgrid", cur_it)
+                # NOTE: if self.plt.escaped (this is for older versions)
+                # self.plt.interactive().close()
     
     @torch.no_grad()
     def postprocess_per_train_step(self, cur_it: int, query_fn, logger: Logger = None):
@@ -162,7 +161,7 @@ class OccupancyGridAS(nn.Module):
     
     @torch.no_grad()
     def debug_vis_tick(self):
-        self.plt.clear([self.world, self.vox])
+        self.plt.remove(self.world, self.vox)
         self.vox = self.debug_vis(draw=False)
         self.world = Box(self.space.origin.data.cpu().numpy(), *(self.space.scale*2).tolist()).wireframe()
-        self.plt.add(self.vox, self.world, resetcam=False)
+        self.plt.show(self.vox, self.world, resetcam=False)

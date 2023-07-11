@@ -212,7 +212,7 @@ class Logger(object):
     def load_stats(self, filename: str):
         filename = os.path.join(self.log_dir, filename + f'_{self.rank}')
         if not os.path.exists(filename):
-            # log.info('=> File "%s" does not exist, will create new after calling save_stats()' % filename)
+            # log.info(f"=> Not exist: {filename}, will create new after calling save_stats()")
             return
 
         try:

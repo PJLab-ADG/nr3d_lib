@@ -202,7 +202,7 @@ def get_ext_occ_grid():
             name='nr3d_lib_bindings._occ_grid', # extension name, import this to use CUDA API
             sources=[os.path.join(csrc_dir, 'occ_grid', f) for f in [
                 'ray_marching.cu',
-                # 'batched_marching.cu',
+                'batched_marching.cu',
                 # 'forest_marching.cu',
                 'occ_grid.cpp',
             ]],

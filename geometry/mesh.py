@@ -149,7 +149,7 @@ def export_pcl_ply(pcl: np.ndarray, pcl_color: np.ndarray = None, filepath: str 
 
     el_verts = plyfile.PlyElement.describe(verts_tuple, "vertex")
     ply_data = plyfile.PlyData([el_verts])
-    log.info("saving pointclouds to %s" % str(filepath))
+    log.info(f"=> Saving pointclouds to {str(filepath)}")
     ply_data.write(filepath)
 
 
@@ -270,7 +270,7 @@ def extract_mesh(
     el_verts = plyfile.PlyElement.describe(verts_tuple, "vertex")
     el_faces = plyfile.PlyElement.describe(faces_tuple, "face")
     ply_data = plyfile.PlyData([el_verts, el_faces])
-    log.info("saving mesh to %s" % str(filepath))
+    log.info(f"=> Saving mesh to {str(filepath)}")
     ply_data.write(filepath)
 
     log.info(f"converting to ply format and writing to file took {time.time() - start_time} s")

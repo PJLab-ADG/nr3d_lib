@@ -8,10 +8,11 @@ import torch
 import numpy as np
 from typing import Literal, Union
 
-def reduce(loss: Union[torch.Tensor, np.ndarray], 
-           mask: Union[torch.Tensor, np.ndarray] = None, 
-           reduction: Literal['mean', 'mean_in_mask', 'sum', 'max', 'min', 'none']='mean'):
-    
+def reduce(
+    loss: Union[torch.Tensor, np.ndarray], 
+    mask: Union[torch.Tensor, np.ndarray] = None, 
+    reduction: Literal['mean', 'mean_in_mask', 'sum', 'max', 'min', 'none']='mean'):
+
     if mask is not None:
         if mask.dim() == loss.dim() - 1:
             mask = mask.view(*loss.shape[:-1], 1).expand_as(loss)

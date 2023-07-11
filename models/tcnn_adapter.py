@@ -33,7 +33,7 @@ try:
         'oneblob':      "OneBlob"
     }
 
-    def tcnn_network_config(D, W, activation:str, output_activation:str, use_cutlass=False):
+    def tcnn_network_config(D, W, activation: str, output_activation: str, use_cutlass=False):
         if not use_cutlass:
             assert W in [16, 32, 64, 128], f"W can only be 16, 32, 64, or 128. If current W={W} is necessary, set `use_cutlass=True` instead."
         activation = nonlinearity_map[activation.lower()]
@@ -49,7 +49,7 @@ try:
             network_config["feedback_alignment"] = False  # Use feedback alignment # [Lillicrap et al. 2016].
         return network_config
 
-    def tcnn_encoding_config(input_dim: int, type:str, **params):
+    def tcnn_encoding_config(input_dim: int, type: str, **params):
         otype = encoding_map[type.lower()]
         encoding_config = {
             'otype': otype,
