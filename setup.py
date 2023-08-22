@@ -367,6 +367,7 @@ def get_ext_spheretrace():
             "-Xcompiler=-mf16c",
             "-Xcompiler=-Wno-float-conversion",
             "-Xcompiler=-fno-strict-aliasing",
+			"-Xcudafe=--diag_suppress=20012",
         ]
     elif os.name == "nt":
         c_flags = ["/std:c++14"]
