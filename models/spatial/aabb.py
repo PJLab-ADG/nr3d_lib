@@ -95,7 +95,7 @@ class AABBSpace(nn.Module):
 
     def ray_test(
         self, rays_o: torch.Tensor, rays_d: torch.Tensor, near=None, far=None,
-        return_rays=True, normalized=False, **extra_ray_shaped):
+        return_rays=True, normalized=False, **extra_ray_data):
         if not normalized: rays_o, rays_d = self.normalize_rays(rays_o, rays_d)
         with torch.no_grad():
             near_, far_ = ray_box_intersection_fast_float_nocheck(rays_o, rays_d, -1., 1.)
@@ -105,7 +105,7 @@ class AABBSpace(nn.Module):
             mask = check1 & check2 & (True if far is None else near_ < far)
             ridx = mask.nonzero().long()[..., 0]
             ret = dict(num_rays=ridx.shape[0], ray_inds=ridx, near=near_[ridx], far=far_[ridx])
-            ret.update({k: v[ridx] if isinstance(v, torch.Tensor) else v for k, v in extra_ray_shaped.items()})
+            ret.update({k: v[ridx] if isinstance(v, torch.Tensor) else v for k, v in extra_ray_data.items()})
         if return_rays:
             ret.update(rays_o=rays_o[ridx], rays_d=rays_d[ridx])
         return ret

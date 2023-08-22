@@ -135,6 +135,8 @@ def get_ext_pack_ops():
         '-D__CUDA_NO_HALF_CONVERSIONS__', 
         '-D__CUDA_NO_HALF2_OPERATORS__',
         '-D__CUDA_NO_BFLOAT16_CONVERSIONS__',
+        f"-gencode=arch=compute_{compute_capability},code=compute_{compute_capability}",
+        f"-gencode=arch=compute_{compute_capability},code=sm_{compute_capability}",
     ]
     
     if os.name == "posix":
@@ -182,6 +184,8 @@ def get_ext_occ_grid():
         '-D__CUDA_NO_HALF_CONVERSIONS__', 
         '-D__CUDA_NO_HALF2_OPERATORS__',
         '-D__CUDA_NO_BFLOAT16_CONVERSIONS__',
+        f"-gencode=arch=compute_{compute_capability},code=compute_{compute_capability}",
+        f"-gencode=arch=compute_{compute_capability},code=sm_{compute_capability}",
     ]
     
     if os.name == "posix":
@@ -225,6 +229,8 @@ def get_ext_spherical_embedder():
         '-U__CUDA_NO_HALF_OPERATORS__', 
         '-U__CUDA_NO_HALF_CONVERSIONS__', 
         '-U__CUDA_NO_HALF2_OPERATORS__',
+        f"-gencode=arch=compute_{compute_capability},code=compute_{compute_capability}",
+        f"-gencode=arch=compute_{compute_capability},code=sm_{compute_capability}",
     ]
     
     if os.name == "posix":
@@ -262,6 +268,8 @@ def get_ext_frequency_embedder():
         '-U__CUDA_NO_HALF_OPERATORS__', 
         '-U__CUDA_NO_HALF_CONVERSIONS__', 
         '-U__CUDA_NO_HALF2_OPERATORS__',
+        f"-gencode=arch=compute_{compute_capability},code=compute_{compute_capability}",
+        f"-gencode=arch=compute_{compute_capability},code=sm_{compute_capability}",
     ]
     
     if os.name == "posix":
@@ -339,6 +347,68 @@ def get_ext_knn_from_pytorch3d():
 
     return ext
 
+def get_ext_spheretrace():
+    nvcc_flags = [
+        "-std=c++14",
+        "--extended-lambda",
+        "--expt-relaxed-constexpr",
+        # The following definitions must be undefined
+        # since half-precision operation is required.
+        '-U__CUDA_NO_HALF_OPERATORS__', 
+        '-U__CUDA_NO_HALF2_OPERATORS__',
+        '-U__CUDA_NO_HALF_CONVERSIONS__', 
+        '-U__CUDA_NO_BFLOAT16_CONVERSIONS__',
+        f"-gencode=arch=compute_{compute_capability},code=compute_{compute_capability}",
+        f"-gencode=arch=compute_{compute_capability},code=sm_{compute_capability}",
+    ]
+    if os.name == "posix":
+        c_flags = ["-std=c++14"]
+        nvcc_flags += [
+            "-Xcompiler=-mf16c",
+            "-Xcompiler=-Wno-float-conversion",
+            "-Xcompiler=-fno-strict-aliasing",
+        ]
+    elif os.name == "nt":
+        c_flags = ["/std:c++14"]
+
+    print(f"Targeting compute capability {compute_capability}")
+
+    definitions = [
+        f"-DTCNN_MIN_GPU_ARCH={compute_capability}",
+        "-DNGP_OPTIX",
+        "-O3",
+        "-DNDEBUG"
+    ]
+    nvcc_flags += definitions
+    c_flags += definitions
+
+    # Some containers set this to contain old architectures that won't compile. We only need the one installed in the machine.
+    os.environ["TORCH_CUDA_ARCH_LIST"] = ""
+
+    # List of sources.
+    csrc_dir = os.path.abspath(os.path.join(SCRIPT_DIR, 'csrc'))
+    source_files = [
+        os.path.join(csrc_dir, "sphere_trace", "src", "entry.cu"),
+        os.path.join(csrc_dir, "sphere_trace", "src", "sphere_tracer.cu")
+    ]
+    libraries = ["cuda"]
+    library_dirs = deepcopy(common_library_dirs)
+    extra_objects = []
+
+    ext = CUDAExtension(
+        name="nr3d_lib_bindings._sphere_trace",
+        sources=source_files,
+        include_dirs=[
+            os.path.join(csrc_dir, "sphere_trace", "include"),
+            os.path.join(csrc_dir, "third_party", "glm"),
+        ],
+        extra_compile_args={"cxx": c_flags, "nvcc": nvcc_flags},
+        libraries=libraries,
+        library_dirs=library_dirs,
+        extra_objects=extra_objects
+    )
+    return ext
+
 def get_extensions():
     ext_modules = []
     ext_modules.append(get_ext_pack_ops())
@@ -348,7 +418,7 @@ def get_extensions():
     ext_modules.append(get_ext_frequency_embedder())
     ext_modules.append(get_ext_knn_from_pytorch3d())
     ext_modules.append(get_ext_lotd())
-    # ext_modules.append(get_ext_deprecated_lod_encoding())
+    ext_modules.append(get_ext_spheretrace())
     return ext_modules
 
 setup(

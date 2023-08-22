@@ -71,7 +71,7 @@ def get_rotation_matrix(
         ox (Union[List, np.ndarray], optional): [3,] Given x-axis' orientation vector in the original coords. Defaults to None.
         oy (Union[List, np.ndarray], optional): [3,] Given y-axis' orientation vector in the original coords. Defaults to None.
         oz (Union[List, np.ndarray], optional): [3,] Given z-axis' orientation vector in the original coords. Defaults to None.
-        preserve (Literal[&#39;x&#39;,&#39;y&#39;,&#39;z&#39;], optional): 
+        preserve (Literal['x','y','z'], optional): 
             Which axis's original direction is preserved between the given to axes' vectors.
             Choose one among x/y/z. Defaults to None.
         left_handed (bool, optional): Whether to calculate a left-handed coords. Defaults to False.
@@ -143,7 +143,7 @@ def get_transformation_matrix(
         ox (Union[List, np.ndarray], optional): [3,] Given x-axis' orientation vector in the original coords. Defaults to None.
         oy (Union[List, np.ndarray], optional): [3,] Given y-axis' orientation vector in the original coords. Defaults to None.
         oz (Union[List, np.ndarray], optional): [3,] Given z-axis' orientation vector in the original coords. Defaults to None.
-        preserve (Literal[&#39;x&#39;,&#39;y&#39;,&#39;z&#39;], optional): 
+        preserve (Literal['x','y','z'], optional): 
             Which axis's original direction is preserved between the given to axes' vectors.
             Choose one among x/y/z. Defaults to None.
 

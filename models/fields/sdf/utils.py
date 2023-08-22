@@ -13,7 +13,7 @@ __all__ = [
 
 import numpy as np
 from tqdm import tqdm
-from typing import Literal
+from typing import Literal, Union
 
 import torch
 import torch.nn as nn
@@ -53,9 +53,13 @@ def idr_geometric_init(decoder: FCBlock, *, radius_init: float, n_embed: int, in
 def pretrain_sdf_sphere(
     implicit_surface: nn.Module, 
     # Training configs
-    num_iters=5000, num_points=5000, lr=1.0e-4, w_eikonal=1.0e-3, safe_mse = True, clip_grad_val: float = 0.1, 
+    num_iters=5000, num_points=5000, 
+    lr=1.0e-4, w_eikonal=1.0e-3, 
+    safe_mse = True, clip_grad_val: float = 0.1, optim_cfg = {}, 
     # Shape configs
-    target_radius=0.5, target_origin=None, bounding_size=2.0, aabb=None, inside_out=False, 
+    target_radius: float=0.5, # In obj coords
+    target_origin: Union[np.ndarray, torch.Tensor]=None, # In obj coords
+    inside_out=False, 
     # Debug & logging related
     logger: Logger=None, log_prefix: str=None, debug_param_detail=False):
     """
@@ -63,27 +67,17 @@ def pretrain_sdf_sphere(
     """
     device = next(implicit_surface.parameters()).device
 
-    if hasattr(implicit_surface, 'preprocess_per_train_step'):
-        implicit_surface.preprocess_per_train_step(0) 
-
-    if aabb is None:
-        aabb_min = torch.ones([3,], device=device) * (-bounding_size/2.)
-        aabb_max = torch.ones([3,], device=device) * (bounding_size/2.)
-    else:
-        aabb = check_to_torch(aabb).reshape([2,3])
-        aabb_min, aabb_max = aabb[0], aabb[1]
-    scale = (aabb_max-aabb_min)/2.
-    origin = (aabb_max+aabb_min)/2.
+    implicit_surface.preprocess_per_train_step(0) 
     
     if target_origin is None:
-        target_origin = (aabb_max+aabb_min)/2.
+        target_origin = implicit_surface.space.origin.clone()
     else:
         target_origin = check_to_torch(target_origin).reshape([3,])
 
     if log_prefix is None: 
         log_prefix = implicit_surface.__class__.__name__
 
-    optimizer = optim.Adam(implicit_surface.parameters(), lr=lr)
+    optimizer = optim.Adam(implicit_surface.parameters(), lr=lr, **optim_cfg)
     scaler = GradScaler(init_scale=128.0)
     if safe_mse:
         loss_eikonal_fn = lambda x: safe_mse_loss(x, x.new_ones(x.shape), reduction='mean', limit=1.0)
@@ -91,17 +85,19 @@ def pretrain_sdf_sphere(
         loss_eikonal_fn = lambda x: F.mse_loss(x, x.new_ones(x.shape), reduction='mean')
     
     with torch.enable_grad():
-        with tqdm(range(num_iters), desc=f"=> pretraining {log_prefix}...") as pbar:
+        
+        with tqdm(range(num_iters), desc=f"=> Pretraining SDF...") as pbar:
             for it in pbar:
-                pts_normalized = torch.empty([num_points, 3], dtype=torch.float, device=device).uniform_(-1+1e-6,1-1e-6)
-                # pts = pts_normalized * scale + origin
+                samples_in_net = torch.empty([num_points, 3], dtype=torch.float, device=device).uniform_(-1+1e-6,1-1e-6)
+                samples_in_obj = implicit_surface.space.unnormalize_coords(samples_in_net)
+                sdf_gt_in_obj = (samples_in_obj - target_origin).norm(dim=-1) - target_radius
+                if inside_out:
+                    sdf_gt_in_obj *= -1
                 
-                if not inside_out:
-                    sdf_gt = pts_normalized.norm(dim=-1) - target_radius
-                else:
-                    sdf_gt = target_radius - pts_normalized.norm(dim=-1)
+                #---- Convert SDF GT value in real-world object's unit to network's unit
+                sdf_gt = sdf_gt_in_obj / implicit_surface.sdf_scale
                 
-                pred = implicit_surface.forward_sdf_nablas(pts_normalized)
+                pred = implicit_surface.forward_sdf_nablas(samples_in_net)
                 pred_sdf = pred['sdf']
                 nablas_norm = pred['nablas'].norm(dim=-1)
                 loss = F.l1_loss(pred_sdf, sdf_gt, reduction='mean') + w_eikonal * loss_eikonal_fn(nablas_norm)
@@ -120,49 +116,57 @@ def pretrain_sdf_sphere(
                 
                 pbar.set_postfix(loss=loss.item())
                 if logger is not None:
-                    logger.add(f"initialize", log_prefix + 'loss', loss.item(), it)
-                    logger.add_nested_dict("initialize", log_prefix + 'sdf.', tensor_statistics(pred_sdf), it)
-                    logger.add_nested_dict("initialize", log_prefix + 'nablas_norm.', tensor_statistics(nablas_norm), it)
+                    logger.add(f"initialize", log_prefix + '.loss', loss.item(), it)
+                    logger.add_nested_dict("initialize", log_prefix + '.sdf', tensor_statistics(pred_sdf), it)
+                    logger.add_nested_dict("initialize", log_prefix + '.nablas_norm', tensor_statistics(nablas_norm), it)
                     if debug_param_detail:
-                        logger.add_nested_dict('initialize', log_prefix + 'encoding.', implicit_surface.encoding.stat_param(with_grad=True), it)
+                        logger.add_nested_dict("initialize", log_prefix + '.encoding', implicit_surface.encoding.stat_param(with_grad=True), it)
 
 def pretrain_sdf_capsule(
     implicit_surface: nn.Module, tracks_in_obj: torch.Tensor, *, 
     # Training configs
-    num_iters=5000, num_points=5000, lr=1.0e-4, w_eikonal=1.0e-3, safe_mse = True, clip_grad_val: float = 0.1, 
+    num_iters=5000, num_points=5000, 
+    lr=1.0e-4, w_eikonal=1.0e-3, 
+    safe_mse = True, clip_grad_val: float = 0.1, optim_cfg = {}, 
     # Shape configs
-    surface_distance: float = 0.2, # In normalized(net) space.
+    surface_distance: float = 0.5, # In obj coords space
+    inside_out=False, 
     # Debug & logging related
     logger: Logger=None, log_prefix: str=None, debug_param_detail=False):
     """
     Pretrain sdf to be a capsule surrounding input track
     """
     device = next(implicit_surface.parameters()).device
-    optimizer = optim.Adam(implicit_surface.parameters(), lr=lr)
+    optimizer = optim.Adam(implicit_surface.parameters(), lr=lr, **optim_cfg)
     scaler = GradScaler(init_scale=128.0)
 
-    if hasattr(implicit_surface, 'preprocess_per_train_step'):
-        implicit_surface.preprocess_per_train_step(0)
+    implicit_surface.preprocess_per_train_step(0)
 
     if safe_mse:
         loss_eikonal_fn = lambda x: safe_mse_loss(x, x.new_ones(x.shape), reduction='mean', limit=1.0)
     else:
         loss_eikonal_fn = lambda x: F.mse_loss(x, x.new_ones(x.shape), reduction='mean')
 
-    tracks_in_net = implicit_surface.space.normalize_coords(tracks_in_obj)
+    # tracks_in_net = implicit_surface.space.normalize_coords(tracks_in_obj)
     
     if log_prefix is None: 
         log_prefix = implicit_surface.__class__.__name__
     
     with torch.enable_grad():
-        with tqdm(range(num_iters), desc=f"=> pretraining {log_prefix}...") as pbar:
+        with tqdm(range(num_iters), desc=f"=> Pretraining SDF...") as pbar:
             for it in pbar:
-                samples = torch.empty([num_points,3], dtype=torch.float, device=device).uniform_(-1, 1)
+                samples_in_net = torch.empty([num_points,3], dtype=torch.float, device=device).uniform_(-1, 1)
+                samples_in_obj = implicit_surface.space.unnormalize_coords(samples_in_net)
                 # [num_points, 1, 3] - [1, num_tracks, 3] = [num_points, num_tracks, 3] -> [num_points, num_tracks] -> [num_samples]
-                min_dis = (samples.unsqueeze(-2) - tracks_in_net.unsqueeze(0)).norm(dim=-1).min(dim=-1).values
-                sdf_gt = surface_distance - min_dis
+                min_dis_in_obj = (samples_in_obj.unsqueeze(-2) - tracks_in_obj.unsqueeze(0)).norm(dim=-1).min(dim=-1).values
+                sdf_gt_in_obj = surface_distance - min_dis_in_obj
+                if inside_out:
+                    sdf_gt_in_obj *= -1
                 
-                pred = implicit_surface.forward_sdf_nablas(samples)
+                #---- Convert SDF GT value in real-world object's unit to network's unit
+                sdf_gt = sdf_gt_in_obj /  implicit_surface.sdf_scale
+                
+                pred = implicit_surface.forward_sdf_nablas(samples_in_net)
                 pred_sdf = pred['sdf']
                 nablas_norm = pred['nablas'].norm(dim=-1)
                 loss = F.l1_loss(pred_sdf, sdf_gt, reduction='mean') + w_eikonal * loss_eikonal_fn(nablas_norm)
@@ -181,21 +185,23 @@ def pretrain_sdf_capsule(
                 
                 pbar.set_postfix(loss=loss.item())
                 if logger is not None:
-                    logger.add(f"initialize", log_prefix + 'loss', loss.item(), it)
-                    logger.add_nested_dict("initialize", log_prefix + 'sdf.', tensor_statistics(pred_sdf), it)
-                    logger.add_nested_dict("initialize", log_prefix + 'nablas_norm.', tensor_statistics(nablas_norm), it)
+                    logger.add(f"initialize", log_prefix + '.loss', loss.item(), it)
+                    logger.add_nested_dict("initialize", log_prefix + '.sdf', tensor_statistics(pred_sdf), it)
+                    logger.add_nested_dict("initialize", log_prefix + '.nablas_norm', tensor_statistics(nablas_norm), it)
                     if debug_param_detail:
-                        logger.add_nested_dict('initialize', log_prefix + 'encoding.', implicit_surface.encoding.stat_param(with_grad=True), it)
+                        logger.add_nested_dict("initialize", log_prefix + '.encoding', implicit_surface.encoding.stat_param(with_grad=True), it)
 
 def pretrain_sdf_road_surface(
     implicit_surface: nn.Module, tracks_in_obj: torch.Tensor, *, 
     # Training configs
-    num_iters=5000, num_points=5000, lr=1.0e-4, w_eikonal=1.0e-3, safe_mse = True, clip_grad_val: float = 0.1, 
+    num_iters=5000, num_points=5000, 
+    lr=1.0e-4, w_eikonal=1.0e-3, 
+    safe_mse = True, clip_grad_val: float = 0.1, optim_cfg = {}, 
     # Shape configs
     # e.g. For waymo, +z points to sky, and ego_car is about 0.5m. Hence, floor_dim='z', floor_up_sign=1, ego_height=0.5
-    floor_dim: Literal['x','y','z'] = 'z', # The vertical dimension of world
+    floor_dim: Literal['x','y','z'] = 'z', # The vertical dimension of obj coords
     floor_up_sign: Literal[1, -1]=-1, # [-1] if (-)dim points to sky else [1]
-    ego_height: float = 0., # Estimated ego's height from road, in world space
+    ego_height: float = 0., # Estimated ego's height from road, in obj coords space
     # Debug & logging related
     logger: Logger=None, log_prefix: str=None, debug_param_detail=False):
     """
@@ -205,44 +211,46 @@ def pretrain_sdf_road_surface(
     other_dims = [i for i in range(3) if i != floor_dim]
     
     device = next(implicit_surface.parameters()).device
-    optimizer = optim.Adam(implicit_surface.parameters(), lr=lr)
+    optimizer = optim.Adam(implicit_surface.parameters(), lr=lr, **optim_cfg)
     scaler = GradScaler(init_scale=128.0)
     
-    if hasattr(implicit_surface, 'preprocess_per_train_step'):
-        implicit_surface.preprocess_per_train_step(0)
+    implicit_surface.preprocess_per_train_step(0)
     
     if safe_mse:
         loss_eikonal_fn = lambda x: safe_mse_loss(x, x.new_ones(x.shape), reduction='mean', limit=1.0)
     else:
         loss_eikonal_fn = lambda x: F.mse_loss(x, x.new_ones(x.shape), reduction='mean')
     
-    tracks_in_net = implicit_surface.space.normalize_coords(tracks_in_obj)
+    # tracks_in_net = implicit_surface.space.normalize_coords(tracks_in_obj)
     
     if log_prefix is None: 
         log_prefix = implicit_surface.__class__.__name__
     
     with torch.enable_grad():
-        with tqdm(range(num_iters), desc=f"=> pretraining {log_prefix}...") as pbar:
+        with tqdm(range(num_iters), desc=f"=> Pretraining SDF...") as pbar:
             for it in pbar:
-                samples = torch.empty([num_points,3], dtype=torch.float, device=device).uniform_(-1, 1)
+                samples_in_net = torch.empty([num_points,3], dtype=torch.float, device=device).uniform_(-1, 1)
+                samples_in_obj = implicit_surface.space.unnormalize_coords(samples_in_net)
                 
                 # For each sample point, find the track point of the minimum distance (measured in 3D space.)
                 # # [num_points, 1, 3] - [1, num_tracks, 3] = [num_points, num_tracks, 3] -> [num_points, num_tracks] -> [num_samples]
-                # min_dis_ret = (samples.unsqueeze(-2) - tracks_in_net.unsqueeze(0)).norm(dim=-1).min(dim=-1)
+                # ret_min_dis_in_obj = (samples_in_obj.unsqueeze(-2) - tracks_in_obj.unsqueeze(0)).norm(dim=-1).min(dim=-1)
                 
                 # For each sample point, find the track point of the minimum distance (measure at 2D space. i.e. xoy plane for floor_dim=z)
                 # [num_points, 1, 3] - [1, num_tracks, 3] = [num_points, num_tracks, 3] -> [num_points, num_tracks] -> [num_samples]
-                min_dis_ret = (samples[..., None, other_dims] - tracks_in_net[None, ..., other_dims]).norm(dim=-1).min(dim=-1)
+                ret_min_dis_in_obj = (samples_in_obj[..., None, other_dims] - tracks_in_obj[None, ..., other_dims]).norm(dim=-1).min(dim=-1)
 
-                # For each sample point, current floor'z coordinate ad floor_dim
-                floor_at_in_net = tracks_in_net[min_dis_ret.indices][..., floor_dim] - floor_up_sign * ego_height / implicit_surface.space.scale[floor_dim]
+                # For each sample point, current floor'z coordinate of floor_dim
+                floor_at_in_obj = tracks_in_obj[ret_min_dis_in_obj.indices][..., floor_dim] - floor_up_sign * ego_height
+                sdf_gt_in_obj = floor_up_sign * (samples_in_obj[..., floor_dim] - floor_at_in_obj)
                 
-                sdf_gt_in_net = floor_up_sign * (samples[..., floor_dim] - floor_at_in_net) 
+                #---- Convert SDF GT value in real-world object's unit to network's unit
+                sdf_gt = sdf_gt_in_obj / implicit_surface.sdf_scale
                 
-                pred_in_net = implicit_surface.forward_sdf_nablas(samples, nablas_has_grad=True)
-                pred_sdf = pred_in_net['sdf']
-                nablas_norm = pred_in_net['nablas'].norm(dim=-1)
-                loss = F.smooth_l1_loss(pred_in_net['sdf'], sdf_gt_in_net, reduction='mean') + w_eikonal * loss_eikonal_fn(nablas_norm)
+                pred = implicit_surface.forward_sdf_nablas(samples_in_net, nablas_has_grad=True)
+                pred_sdf = pred['sdf']
+                nablas_norm = pred['nablas'].norm(dim=-1)
+                loss = F.smooth_l1_loss(pred['sdf'], sdf_gt, reduction='mean') + w_eikonal * loss_eikonal_fn(nablas_norm)
                 
                 optimizer.zero_grad()
                 
@@ -258,8 +266,8 @@ def pretrain_sdf_road_surface(
                 
                 pbar.set_postfix(loss=loss.item())
                 if logger is not None:
-                    logger.add(f"initialize", log_prefix + 'loss', loss.item(), it)
-                    logger.add_nested_dict("initialize", log_prefix + 'sdf.', tensor_statistics(pred_sdf), it)
-                    logger.add_nested_dict("initialize", log_prefix + 'nablas_norm.', tensor_statistics(nablas_norm), it)
+                    logger.add(f"initialize", log_prefix + '.loss', loss.item(), it)
+                    logger.add_nested_dict("initialize", log_prefix + '.sdf', tensor_statistics(pred_sdf), it)
+                    logger.add_nested_dict("initialize", log_prefix + '.nablas_norm', tensor_statistics(nablas_norm), it)
                     if debug_param_detail:
-                        logger.add_nested_dict('initialize', log_prefix + 'encoding.', implicit_surface.encoding.stat_param(with_grad=True), it)
+                        logger.add_nested_dict("initialize", log_prefix + '.encoding', implicit_surface.encoding.stat_param(with_grad=True), it)

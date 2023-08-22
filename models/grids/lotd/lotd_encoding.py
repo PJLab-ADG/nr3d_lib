@@ -23,7 +23,9 @@ from nr3d_lib.utils import tensor_statistics, torch_dtype
 from nr3d_lib.models.spatial import AABBSpace
 from nr3d_lib.models.utils import batchify_query, clip_norm_
 from nr3d_lib.models.grids.lotd.lotd import LoTD, LoDType
-from nr3d_lib.models.grids.lotd.lotd_helpers import LoTDAnnealer, auto_compute_lotd_cfg_deprecated, auto_compute_ngp_cfg, auto_compute_ngp4d_cfg, param_interpolate, param_vertices, level_param_index_shape
+from nr3d_lib.models.grids.lotd.lotd_helpers import LoTDAnnealer, \
+    auto_compute_lotd_cfg_deprecated, auto_compute_ngp_cfg, auto_compute_ngp4d_cfg, \
+    gen_ngp_cfg, param_interpolate, param_vertices, level_param_index_shape
 
 try:
     import tensorly
@@ -37,8 +39,8 @@ class LoTDEncoding(nn.Module):
         self, 
         input_ch=3, *,
         lotd_cfg: ConfigDict = None, 
-        lotd_use_cuboid = False, # Whether allow cuboid-shaped LoTD
         lotd_auto_compute_cfg: ConfigDict = None, # (Optional) auto-compute LoTD config from aabb
+        lotd_use_cuboid = False, # Whether allow cuboid-shaped LoTD
         bounding_size=2.0, # Network's boundary size; coordinates are within [-bounding_size/2, bounding_size/2]
         aabb=None, # Network's boundary; coordinates are within [aabb[0], aabb[1]]
         anneal_cfg: ConfigDict = None,
@@ -52,25 +54,28 @@ class LoTDEncoding(nn.Module):
         self.dtype = torch_dtype(dtype)
 
         self.clip_level_grad_ema_factor = clip_level_grad_ema_factor
-        self.if_clip_level_grad_ema = clip_level_grad_ema_factor > 0
+        self.should_clip_level_grad_with_ema = clip_level_grad_ema_factor > 0
         self.param_init_cfg = param_init_cfg
 
         #------- Valid representing space
         self.space = AABBSpace(bounding_size=bounding_size, aabb=aabb, device=self.device)
         
         #------- LoTD Metadata
-        assert int(lotd_cfg is not None) + (lotd_auto_compute_cfg is not None), "Please specify one and only one of `lotd_cfg` and `lotd_auto_compute_cfg`"
+        assert bool(lotd_cfg is not None) != bool(lotd_auto_compute_cfg is not None), "Please specify one and only one of `lotd_cfg` and `lotd_auto_compute_cfg`"
         if lotd_auto_compute_cfg is not None:
             aspect_ratio = 1 if not lotd_use_cuboid else self.space.stretch.tolist()
             lotd_auto_compute_cfg = lotd_auto_compute_cfg.copy()
-            if (auto_compute_type:=lotd_auto_compute_cfg.pop('type')) == 'ngp':
-                lotd_cfg = auto_compute_ngp_cfg(aspect_ratio, dim=input_ch, **lotd_auto_compute_cfg)
-            elif auto_compute_type == 'lotd':
-                lotd_cfg = auto_compute_lotd_cfg_deprecated(aspect_ratio, dim=input_ch,
-                                                            **lotd_auto_compute_cfg)
+            if (auto_compute_type:=lotd_auto_compute_cfg.pop('type')) == 'gen_ngp':
+                lotd_cfg = gen_ngp_cfg(dim=input_ch, **lotd_auto_compute_cfg)
+            elif auto_compute_type == 'ngp':
+                lotd_cfg = auto_compute_ngp_cfg(aspect_ratio, dim=input_ch, 
+                                                **lotd_auto_compute_cfg)
             elif auto_compute_type == 'ngp4d':
                 lotd_cfg = auto_compute_ngp4d_cfg(dim=input_ch, stretch=aspect_ratio,
                                                   **lotd_auto_compute_cfg)
+            elif auto_compute_type == 'lotd':
+                lotd_cfg = auto_compute_lotd_cfg_deprecated(aspect_ratio, dim=input_ch,
+                                                            **lotd_auto_compute_cfg)
             else:
                 raise RuntimeError(f"Invalid auto_compute_type={auto_compute_type}")
         
@@ -99,7 +104,7 @@ class LoTDEncoding(nn.Module):
         self.max_level: int = None 
         
         #------- Ema grad storage
-        if self.if_clip_level_grad_ema:
+        if self.should_clip_level_grad_with_ema:
             self.register_buffer("level_grad_norm_ema", torch.full([self.lotd.n_levels], 0.1, dtype=torch.float, device=self.device))
         
         #------- Bind lod param getter/setter
@@ -450,7 +455,7 @@ class LoTDEncoding(nn.Module):
 
     @torch.no_grad()
     def custom_grad_clip_step(self, val: float=None):
-        if self.if_clip_level_grad_ema:
+        if self.should_clip_level_grad_with_ema:
             # gnorm = torch.stack([self.get_level_param(l, grad=True).data.abs().max() for l in range(self.lotd.n_levels)])
             gnorm = torch.stack([self.get_level_param(l, grad=True).data.norm() for l in range(self.lotd.n_levels)])
             
@@ -465,25 +470,26 @@ class LoTDEncoding(nn.Module):
                 clip_norm_(self.flattened_params.grad[index], val)
     
     @torch.no_grad()
-    def stat_param(self, with_grad=False, prefix='') -> Dict[str, float]:
+    def stat_param(self, with_grad=False, prefix: str='') -> Dict[str, float]:
+        prefix_ = prefix + ('.' if prefix and not prefix.endswith('.') else '')
         ret = {}
-        ret.update({prefix + f'total.{k}': v for k,v in tensor_statistics(self.flattened_params.data).items()})
+        ret.update({prefix_ + f'total.{k}': v for k,v in tensor_statistics(self.flattened_params.data).items()})
         if with_grad and self.flattened_params.grad is not None:
-            ret.update({prefix + f'grad_total.{k}': v for k,v in tensor_statistics(self.flattened_params.grad.data).items()})
+            ret.update({prefix_ + f'grad_total.{k}': v for k,v in tensor_statistics(self.flattened_params.grad.data).items()})
         for lvl, tp in enumerate(self.lotd.level_types):
             tp = LoDType(tp)
             if tp == LoDType.VectorMatrix:
-                ret.update({prefix + f'lv.{lvl}.vec.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'vec').data).items()})
-                ret.update({prefix + f'lv.{lvl}.mat.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'mat').data).items()})
+                ret.update({prefix_ + f'lv.{lvl}.vec.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'vec').data).items()})
+                ret.update({prefix_ + f'lv.{lvl}.mat.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'mat').data).items()})
                 if with_grad:
-                    ret.update({prefix + f'grad.lv.{lvl}.vec.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'vec', grad=True).data).items()})
-                    ret.update({prefix + f'grad.lv.{lvl}.mat.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'mat', grad=True).data).items()})
+                    ret.update({prefix_ + f'grad.lv.{lvl}.vec.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'vec', grad=True).data).items()})
+                    ret.update({prefix_ + f'grad.lv.{lvl}.mat.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, 'mat', grad=True).data).items()})
             else:
-                ret.update({prefix + f'lv.{lvl}.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl).data).items()})
+                ret.update({prefix_ + f'lv.{lvl}.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl).data).items()})
                 if with_grad:
-                    ret.update({prefix + f'grad.lv.{lvl}.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, grad=True).data).items()})
-        if self.if_clip_level_grad_ema:
-            ret.update({prefix + f'grad.lv.{lvl}.ema': self.level_grad_norm_ema[lvl].item() for lvl in range(self.lotd.n_levels)})
+                    ret.update({prefix_ + f'grad.lv.{lvl}.{k}': v for k,v in tensor_statistics(self.get_level_param(lvl, grad=True).data).items()})
+        if self.should_clip_level_grad_with_ema:
+            ret.update({prefix_ + f'grad.lv.{lvl}.ema': self.level_grad_norm_ema[lvl].item() for lvl in range(self.lotd.n_levels)})
         return ret
 
 if __name__ == "__main__":

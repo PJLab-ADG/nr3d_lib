@@ -11,8 +11,9 @@ __all__ = [
     'safe_mse_loss'
 ]
 
+from numbers import Number
 import numpy as np
-from typing import Literal
+from typing import Literal, Tuple, Union
 
 import torch
 from torch import autograd
@@ -60,6 +61,7 @@ class SafeBCE(autograd.Function):
             # grad_x = ( (1-y)/(1-x) - y/x ) * grad_output
         if ctx.needs_input_grad[1]:
             grad_y = (torch.log(1-x) - torch.log(x)) * grad_output * (~(x==y))
+        #---- x, y, limit
         return grad_x, grad_y, None
 
 def safe_binary_cross_entropy(input: torch.Tensor, target: torch.Tensor, limit: float = 0.1, reduction="mean") -> torch.Tensor:
@@ -70,16 +72,20 @@ class ClippedMSE(autograd.Function):
     @staticmethod
     def forward(ctx, input, target, limit):
         # Safer when there are extreme values, while still with gradients on those clipped extreme values.
-        err = (input - target).clamp_(-limit, limit)
+        lmin, lmax = limit
+        err = (input - target).clamp_(lmin, lmax)
         ctx.save_for_backward(err)
         return err.square()
     @staticmethod
     def backward(ctx, grad):
         err, *_ = ctx.saved_tensors
         grad_input = 2 * grad * err
-        return grad_input, None, None, None
+        #---- input, target, limit
+        return grad_input, None, None
 
-def safe_mse_loss(input: torch.Tensor, target: torch.Tensor, reduction:Literal['mean', 'none'] = 'none', limit: float = 1.) -> torch.Tensor:
+def safe_mse_loss(input: torch.Tensor, target: torch.Tensor, reduction:Literal['mean', 'none'] = 'none', limit: Union[float, Tuple[float,float]] = 1.) -> torch.Tensor:
+    if isinstance(limit, Number):
+        limit = (-limit, limit)
     loss = ClippedMSE.apply(input, target, limit)
     return reduce(loss, None, reduction=reduction)
 
@@ -123,6 +129,7 @@ if __name__ == "__main__":
     def test_mse(device=torch.device('cuda')):
         from torch.utils.benchmark import Timer
         import torch.nn.functional as F
+        from icecream import ic
         x = 2 ** torch.randn([7])
         x[4] = 1e+9
         y = torch.ones([7])
@@ -135,8 +142,8 @@ if __name__ == "__main__":
         l2 = safe_mse_loss(x2, y, 'mean', 10.0)
         l2.backward()
         
-        print(x1.grad)
-        print(x2.grad)
+        ic(x1.grad)
+        ic(x2.grad)
 
         x = 2 ** torch.randn([2**18], device=device)
         y = torch.ones([2**18], device=device)

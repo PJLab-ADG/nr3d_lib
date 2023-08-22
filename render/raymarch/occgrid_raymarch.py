@@ -37,7 +37,7 @@ def occgrid_raymarch(
         rays_d (torch.Tensor): Ray directions.
         near (Union[torch.Tensor, float]): Near depth of marching.
         far (Union[torch.Tensor, float]): Far depth of marching.
-        constraction (Literal[&#39;aabb&#39;, &#39;tanh&#39;, &#39;sphere&#39;], optional): 
+        constraction (Literal['aabb', 'tanh', 'sphere'], optional): 
             Type of space contraction. Defaults to 'aabb'.
         perturb (bool, optional): Whether to randomize the marching process. Defaults to False.
         perturb_before_march (bool, optional): 
@@ -130,7 +130,7 @@ def batched_occgrid_raymarch(
         near (Union[torch.Tensor, float]): Near depth of marching.
         far (Union[torch.Tensor, float]): Far depth of marching.
         batch_inds (torch.Tensor, optional): Optional batch indices corresponding to each input. Defaults to None.
-        constraction (Literal[&#39;aabb&#39;, &#39;tanh&#39;, &#39;sphere&#39;], optional): 
+        constraction (Literal['aabb', 'tanh', 'sphere'], optional): 
             Type of space contraction. Defaults to 'aabb'.
         perturb (bool, optional): Whether to randomize the marching process. Defaults to False.
         perturb_before_march (bool, optional): 

@@ -19,7 +19,7 @@ import numpy as np
 from PIL import Image
 from math import prod
 from collections import namedtuple
-from typing import Iterator, Iterable, List, Dict, Tuple, Union, Generic, TypeVar
+from typing import Iterator, Iterable, List, Dict, Literal, Tuple, Union, Generic, TypeVar
 
 import skimage
 from skimage.transform import resize as cpu_resize
@@ -376,26 +376,36 @@ def zip_two_nested_dict(d1: dict, d2: dict):
         yield cur_d1, cur_d2
 
 
-def collate_nested_dict(batch: List[dict]):
-    """
-    Collate a batch of nested dicts (each with the same nested dict structure)
+def collate_nested_dict(batch: List[dict], stack=True) -> dict:
+    """ Collate a list of [nested dict] (each item with the same nested dict structure)
+
+    Args:
+        batch (List[dict]): The input list of [nested dict]
+        stack (bool, optional): Whether to stack tensor lists. Defaults to True.
+
+    Returns:
+        dict: The collated nested dict (of list)
     """
     elem = batch[0]
     if isinstance(elem, dict):
-        return {k: collate_nested_dict([d[k] for d in batch]) for k in elem.keys()}
-    elif isinstance(elem, torch.Tensor):
+        return {k: collate_nested_dict([d[k] for d in batch], stack=stack) for k in elem.keys()}
+    elif isinstance(elem, torch.Tensor) and stack:
         return torch.stack(batch, 0)
     else:
         return batch  # Leave untouched (list)
 
+def collate_tuple_of_nested_dict(batch: List[Tuple[dict]], stack=True) -> Tuple[dict]:
+    """ Collate a list of [tuple of nested dicts]
 
-def collate_tuple_of_nested_dict(batch: List[Tuple[dict]]) -> Tuple[dict]:
-    """
-    Collate a tuple of batches of nested dicts (each with the same nested dict structure)
+    Args:
+        batch (List[Tuple[dict]]): The input list of [tuple of nested dict]
+        stack (bool, optional): Whether to stack tensor lists. Defaults to True.
+
+    Returns:
+        Tuple[dict]: The tuple of collacted nested dict (of list)
     """
     batch = zip(*batch)
-    return tuple([collate_nested_dict(d) for d in batch])
-
+    return tuple([collate_nested_dict(d, stack=stack) for d in batch])
 
 def partialclass(cls, *args, **kwds):
     """
@@ -465,14 +475,14 @@ def check_to_torch(
 
 def img_to_torch_and_downscale(
     x: Union[np.ndarray, torch.Tensor], *, 
-    downscale:float=1, if_cpu_downscale=False, antialias=False, 
+    downscale:float=1, use_cpu_downscale=False, antialias=False, 
     dtype=None, device=None):
     """ Check, convert and apply downscale to input image `x`
     
     Args:
         x (Union[np.ndarray, torch.Tensor]): [H, W, (...)] Input image
         downscale (float, optional): Downscaling ratio. Defaults to 1.
-        if_cpu_downscale (bool, optional): Whether use CPU downscaling algo (T), or use GPU (F). Defaults to False.
+        use_cpu_downscale (bool, optional): Whether use CPU downscaling algo (T), or use GPU (F). Defaults to False.
         antialias (bool, optional): Whether use anti-aliasing. Defaults to False.
         dtype (torch.dtype, optional): Output torch.dtype. Defaults to None.
         device (torch.device, optional): Output torch.device. Defaults to None.
@@ -484,7 +494,7 @@ def img_to_torch_and_downscale(
     if downscale != 1:
         H_ = int(H // downscale)
         W_ = int(W // downscale)
-        if if_cpu_downscale:
+        if use_cpu_downscale:
             x_np = x if isinstance(x, np.ndarray) else x.data.cpu().numpy()
             x = torch.tensor(cpu_resize(x_np, (H_, W_), anti_aliasing=antialias),
                              dtype=dtype, device=device)
@@ -498,8 +508,10 @@ def img_to_torch_and_downscale(
         assert [H_, W_] == [*x.shape[:2]]
     return check_to_torch(x, dtype=dtype, device=device)
 
-def pad_images_bottom_right_to_same_size(imgs: List[Union[torch.Tensor, np.ndarray]], value=0):
-    """ Pad images of different sizes at bottom & right to have the same size
+def pad_images_to_same_size(
+    imgs: List[Union[torch.Tensor, np.ndarray]], value=0, 
+    padding: Literal['bottom_right', 'bottom_left', 'top_left', 'top_right']='bottom_right'):
+    """ Pad images of possibly different sizes to have the same size
     NOTE: Expects inputs to be HW(C)
 
     Args:
@@ -516,24 +528,78 @@ def pad_images_bottom_right_to_same_size(imgs: List[Union[torch.Tensor, np.ndarr
         # Already satisfied.
         return imgs
     
-    if isinstance(imgs[0], torch.Tensor):
-        if imgs[0].dim() == 2:
-            padded_imgs = [ # NOTE: Axis order is reversed.
-                F.pad(im.unsqueeze(0), (0, max_width-im.shape[1], 0, max_height-im.shape[0]), 
-                      mode='constant', value=value).squeeze(0) for im in imgs
+    if padding == 'bottom_right':
+        if isinstance(imgs[0], torch.Tensor):
+            if imgs[0].dim() == 2:
+                padded_imgs = [ # NOTE: Axis order is reversed.
+                    F.pad(im.unsqueeze(0), (0, max_width-im.shape[1], 0, max_height-im.shape[0]), 
+                        mode='constant', value=value).squeeze(0) for im in imgs
+                ]
+            else:
+                padded_imgs = [ # NOTE: Axis order is reversed.
+                    F.pad(im.permute(2, 0, 1), (0, max_width-im.shape[1], 0, max_height-im.shape[0]), 
+                        mode='constant', value=value).permute(1, 2, 0) for im in imgs
+                ]
+        elif isinstance(imgs[0], np.ndarray):
+            padded_imgs = [
+                np.pad(im, ((0, max_height-im.shape[0]), (0, max_width-im.shape[1]), (0, 0)), 
+                    mode='constant', constant_values=value) for im in imgs
             ]
         else:
-            padded_imgs = [ # NOTE: Axis order is reversed.
-                F.pad(im.permute(2, 0, 1), (0, max_width-im.shape[1], 0, max_height-im.shape[0]), 
-                      mode='constant', value=value).permute(1, 2, 0) for im in imgs
+            raise RuntimeError(f"Invalid input type={type(imgs[0])}")
+    elif padding == 'bottom_left':
+        if isinstance(imgs[0], torch.Tensor):
+            if imgs[0].dim() == 2:
+                padded_imgs = [
+                    F.pad(im.unsqueeze(0), (max_width-im.shape[1], 0, 0, max_height-im.shape[0]), 
+                        mode='constant', value=value).squeeze(0) for im in imgs
+                ]
+            else:
+                padded_imgs = [
+                    F.pad(im.permute(2, 0, 1), (max_width-im.shape[1], 0, 0, max_height-im.shape[0]), 
+                        mode='constant', value=value).permute(1, 2, 0) for im in imgs
+                ]
+        elif isinstance(imgs[0], np.ndarray):
+            padded_imgs = [
+                np.pad(im, ((0, max_height-im.shape[0]), (max_width-im.shape[1], 0), (0, 0)), 
+                    mode='constant', constant_values=value) for im in imgs
             ]
-    elif isinstance(imgs[0], np.ndarray):
-        padded_imgs = [
-            np.pad(im, ((0, max_height-im.shape[0]), (0, max_width-im.shape[1]), (0, 0)), 
-                   mode='constant', constant_values=value) for im in imgs
-        ]
+    elif padding == 'top_left':
+        if isinstance(imgs[0], torch.Tensor):
+            if imgs[0].dim() == 2:
+                padded_imgs = [
+                    F.pad(im.unsqueeze(0), (max_width-im.shape[1], 0, max_height-im.shape[0], 0), 
+                        mode='constant', value=value).squeeze(0) for im in imgs
+                ]
+            else:
+                padded_imgs = [
+                    F.pad(im.permute(2, 0, 1), (max_width-im.shape[1], 0, max_height-im.shape[0], 0), 
+                        mode='constant', value=value).permute(1, 2, 0) for im in imgs
+                ]
+        elif isinstance(imgs[0], np.ndarray):
+            padded_imgs = [
+                np.pad(im, ((max_height-im.shape[0], 0), (max_width-im.shape[1], 0), (0, 0)), 
+                    mode='constant', constant_values=value) for im in imgs
+            ]
+    elif padding == 'top_right':
+        if isinstance(imgs[0], torch.Tensor):
+            if imgs[0].dim() == 2:
+                padded_imgs = [
+                    F.pad(im.unsqueeze(0), (0, max_width-im.shape[1], max_height-im.shape[0], 0), 
+                        mode='constant', value=value).squeeze(0) for im in imgs
+                ]
+            else:
+                padded_imgs = [
+                    F.pad(im.permute(2, 0, 1), (0, max_width - im.shape[1], max_height - im.shape[0], 0), 
+                        mode='constant', value=value).permute(1, 2, 0) for im in imgs
+                ]
+        elif isinstance(imgs[0], np.ndarray):
+            padded_imgs = [
+                np.pad(im, ((max_height-im.shape[0], 0), (0, max_width-im.shape[1]), (0, 0)), 
+                    mode='constant', constant_values=value) for im in imgs
+            ]
     else:
-        raise RuntimeError(f"Invalid input type={type(imgs[0])}")
+        raise RuntimeError(f"Invalid padding={padding}")
     
     return padded_imgs
 
@@ -593,7 +659,7 @@ def key_contains(d: dict, v: str):
     return False
 
 
-def tensor_statistics(t: Union[torch.Tensor, np.ndarray], prefix='', metrics: List[str] = None) -> Dict[str, float]:
+def tensor_statistics(t: Union[torch.Tensor, np.ndarray], prefix: str='', metrics: List[str] = None) -> Dict[str, float]:
     """ Generate statistics data dict for a given tensor
 
     Args:
@@ -621,7 +687,7 @@ def tensor_statistics(t: Union[torch.Tensor, np.ndarray], prefix='', metrics: Li
         }
     if metrics is None:
         metrics = metric_fn.keys()
-    return {f"{prefix}{key}": metric_fn[key](data).item() for key in metrics if key in metric_fn}
+    return {f"{prefix}{'.' if prefix and not prefix.endswith('.') else ''}{key}": metric_fn[key](data).item() for key in metrics if key in metric_fn}
 
 
 def get_shape(t):
@@ -819,7 +885,7 @@ def line_count_project(
     for k in filetypes_line_counts.keys():
         print(f"  {k}: lines: {filetypes_line_counts[k]}, ratio: {filetypes_ratio[k]*100.:.2f}%")
 
-def save_video(imgs, fname, as_gif=False, fps=24, quality=8, already_np=False, gif_scale: int = 512):
+def save_video(imgs, fname, as_gif=False, fps=24, quality=5, already_np=False, gif_scale: int = 512):
     """ Save images to video
 
     Args:
@@ -827,7 +893,7 @@ def save_video(imgs, fname, as_gif=False, fps=24, quality=8, already_np=False, g
         fname ([type]): [description]
         as_gif (bool, optional): [description]. Defaults to False.
         fps (int, optional): [description]. Defaults to 24.
-        quality (int, optional): [description]. Defaults to 8.
+        quality (int, optional): [description]. Defaults to 5.
     """
     gif_scale = int(gif_scale)
     # convert to np.uint8

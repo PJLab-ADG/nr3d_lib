@@ -16,12 +16,14 @@ import torch.nn.functional as F
 
 from nr3d_lib.fmt import log
 from nr3d_lib.utils import torch_dtype
+from nr3d_lib.profile import profile
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.layers import DenseLayer, get_nonlinearity
 
 try:
     import tinycudann as tcnn
     from nr3d_lib.models.tcnn_adapter import TcnnFCBlock, TcnnFCBlockWSkips, TcnnNet, TcnnNetWSkips, tcnn_encoding_config, tcnn_network_config
-    class TcnnNeRF(nn.Module):
+    class TcnnNeRF(ModelMixin, nn.Module):
         def __init__(
             self, input_ch_pts=3, input_ch_view=3, use_view_dirs=True, 
             D=8, W=128, skips=[4], activation: str='relu', sigma_activation: str='none', rgb_acitvation: str='sigmoid', 
@@ -60,7 +62,7 @@ try:
                 sigma = self.sigma_activation(outputs[..., 3:])
             return sigma.squeeze(-1)
 
-    class TcnnEmbeddedNeRF(nn.Module):
+    class TcnnEmbeddedNeRF(ModelMixin, nn.Module):
         def __init__(
             self,
             n_pos_dims=3, pos_embed_cfg:dict={'type':'sinusoidal', 'n_frequencies': 10}, pos_embed_include_input=False,
@@ -157,7 +159,7 @@ try:
             sigma = self.sigma_layer(h)
             return sigma.squeeze(-1)
 
-    class TcnnRadianceNet(tcnn.NetworkWithInputEncoding):
+    class TcnnRadianceNet(ModelMixin, tcnn.NetworkWithInputEncoding):
         # NOTE: Direct use tcnn's NetworkWithInputEncoding holistic model.
         def __init__(
             self, 
@@ -236,6 +238,7 @@ try:
             self.out_features = 3
             self.to(device)
         
+        @profile
         def forward(self, x: torch.Tensor, v: torch.Tensor=None, n: torch.Tensor=None, *, h_extra: torch.Tensor=None, h_appear_embed: torch.Tensor=None) -> torch.Tensor:
             prefix = x.shape[:-1]
             uses = self._uses
@@ -249,11 +252,11 @@ try:
 except ImportError:
     log.info("tinycudann is not installed")
     
-    class TcnnNeRF:
+    class TcnnNeRF(ModelMixin, nn.Module):
         pass
-    class TcnnEmbeddedNeRF:
+    class TcnnEmbeddedNeRF(ModelMixin, nn.Module):
         pass
-    class TcnnRadianceNet:
+    class TcnnRadianceNet(ModelMixin, nn.Module):
         pass
     
 

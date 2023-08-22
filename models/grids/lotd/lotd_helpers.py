@@ -351,6 +351,17 @@ def param_interpolate(param: torch.Tensor, rel_x: torch.Tensor, res: int, is_for
             ret = F.grid_sample(param, rel_x, align_corners=False, padding_mode="zeros")
         return ret.view(B, -1, N).permute(0,2,1).unflatten(1, data_shape)
 
+def gen_ngp_cfg(
+    min_res: int = 16, dim: int = 3, n_feats: int = 2, log2_hashmap_size: int = 19, 
+    per_level_scale: float = 1.382, num_levels: int = 16
+):
+    hashmap_size = 2**log2_hashmap_size
+    level_res = min_res * per_level_scale ** np.arange(num_levels)
+    level_res = level_res.astype(int)
+    level_n_feats = [n_feats] * num_levels
+    level_types = [ ("Dense" if res ** dim <= hashmap_size else "Hash")  for res in level_res]
+    return dict(lod_res=level_res.tolist(), lod_n_feats=level_n_feats, lod_types=level_types, hashmap_size=hashmap_size)
+
 def auto_compute_ngp_cfg(
     stretch: Union[float, List[float]], target_num_params: int, 
     *, dim: int = 3, n_feats: int = 2, log2_hashmap_size: int = 19, min_res: int = 4, 
@@ -670,10 +681,10 @@ class LoTD2ndGradGuard(nn.Module):
                     clip_norm_(dL_ddLdy[..., nf_cumsum[l]:nf_cumsum[l+1]], val)
         
         if self.logger is not None:
-            self.logger.add(self.log_prefix + "dbg_grad_direct.dl_ddldx", "norm_ema", dlddldx_ema.item(), self.logger.last_step)
+            self.logger.add(self.log_prefix + ".dbg_grad_direct.dl_ddldx", "norm_ema", dlddldx_ema.item(), self.logger.last_step)
             for l in range(self.lod_meta.n_levels):
-                self.logger.add(self.log_prefix + "dbg_grad_direct.dl_dgrid", f"lv.{l}.norm_ema", dldgrid_ema[l].item(), self.logger.last_step)
-                self.logger.add(self.log_prefix + "dbg_grad_direct.dl_ddldy", f"lv.{l}.norm_ema", dlddldy_ema[l].item(), self.logger.last_step)
+                self.logger.add(self.log_prefix + ".dbg_grad_direct.dl_dgrid", f"lv.{l}.norm_ema", dldgrid_ema[l].item(), self.logger.last_step)
+                self.logger.add(self.log_prefix + ".dbg_grad_direct.dl_ddldy", f"lv.{l}.norm_ema", dlddldy_ema[l].item(), self.logger.last_step)
 
             self.log_2nd_grad(dL_ddLdx, dy_dx, dL_dgrid, dL_ddLdy)
 
@@ -682,29 +693,29 @@ class LoTD2ndGradGuard(nn.Module):
         if self.logger is not None:
             logger = self.logger
             nf_cumsum = self.level_n_feats_cumsum
-            logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dl_ddldx", "total.", tensor_statistics(dL_ddLdx), logger.last_step)
+            logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dl_ddldx", "total", tensor_statistics(dL_ddLdx), logger.last_step)
             
-            logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dydx", "total.", tensor_statistics(dy_dx), logger.last_step)
+            logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dydx", "total", tensor_statistics(dy_dx), logger.last_step)
             for l in range(self.lod_meta.n_levels):
-                logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dydx", f"lv.{l}.", tensor_statistics(dy_dx.view(-1, self.lod_meta.n_encoded_dims, 3)[..., nf_cumsum[l]:nf_cumsum[l+1], :]), logger.last_step)
+                logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dydx", f"lv.{l}", tensor_statistics(dy_dx.view(-1, self.lod_meta.n_encoded_dims, 3)[..., nf_cumsum[l]:nf_cumsum[l+1], :]), logger.last_step)
             
             if dL_dgrid is not None:
-                logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dl_dgrid", "total.", tensor_statistics(dL_dgrid), logger.last_step)
+                logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dl_dgrid", "total", tensor_statistics(dL_dgrid), logger.last_step)
                 for l, tp in enumerate(self.lod_meta.level_types):
                     tp = LoDType(tp)
                     if tp == LoDType.VectorMatrix:
                         stat_vec_grad = tensor_statistics(get_level_param(dL_dgrid.data, self.lod_meta, l, 'vec'))
                         stat_mat_grad = tensor_statistics(get_level_param(dL_dgrid.data, self.lod_meta, l, 'mat'))
-                        logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dl_dgrid", f"lv.{l}.vec.", stat_vec_grad, logger.last_step)
-                        logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dl_dgrid", f"lv.{l}.mat.", stat_mat_grad, logger.last_step)
+                        logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dl_dgrid", f"lv.{l}.vec", stat_vec_grad, logger.last_step)
+                        logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dl_dgrid", f"lv.{l}.mat", stat_mat_grad, logger.last_step)
                     else:
                         stat_grad = tensor_statistics(get_level_param(dL_dgrid.data, self.lod_meta, l))
-                        logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dl_dgrid", f"lv.{l}.", stat_grad, logger.last_step)
+                        logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dl_dgrid", f"lv.{l}", stat_grad, logger.last_step)
             
             if dL_ddLdy is not None:
-                logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dl_ddldy", "total.", tensor_statistics(dL_ddLdy), logger.last_step)
+                logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dl_ddldy", "total", tensor_statistics(dL_ddLdy), logger.last_step)
                 for l in range(self.lod_meta.n_levels):
-                    logger.add_nested_dict(self.log_prefix + "dbg_grad_direct.dl_ddldy", f"lv.{l}.", tensor_statistics(dL_ddLdy[..., nf_cumsum[l]:nf_cumsum[l+1]]), logger.last_step)
+                    logger.add_nested_dict(self.log_prefix + ".dbg_grad_direct.dl_ddldy", f"lv.{l}", tensor_statistics(dL_ddLdy[..., nf_cumsum[l]:nf_cumsum[l+1]]), logger.last_step)
 
 class LoTDAnnealer(nn.Module):
     def __init__(

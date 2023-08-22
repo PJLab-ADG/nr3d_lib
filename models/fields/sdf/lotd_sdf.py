@@ -21,18 +21,20 @@ from nr3d_lib.config import ConfigDict
 from nr3d_lib.utils import tensor_statistics, torch_dtype
 
 from nr3d_lib.models.utils import clip_norm_
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.blocks import get_blocks
 from nr3d_lib.models.embedders import get_embedder
 from nr3d_lib.models.grids.lotd import LoTDEncoding, get_lotd_decoder
 from nr3d_lib.models.fields.sdf.utils import idr_geometric_init, pretrain_sdf_sphere
 
-class LoTDSDF(nn.Module):
+class LoTDSDF(ModelMixin, nn.Module):
     def __init__(
         self,
         
         encoding_cfg: ConfigDict,
         decoder_cfg: ConfigDict,
         n_rgb_used_output: int = 0,
+        sdf_scale: float = 1.0, # Length in real-world object's coord represented by one unit of SDF
         
         extra_pos_embed_cfg: dict = None,
         bounding_size=2.0, aabb=None, radius_init=0.5, 
@@ -40,7 +42,7 @@ class LoTDSDF(nn.Module):
         
         clip_level_grad_ema_factor: float=0, 
 
-        dtype=torch.float, device=torch.device("cuda"), use_tcnn_backend=False
+        dtype=torch.float, device=torch.device("cuda"), use_tcnn_backend=False, 
         ) -> None:
         super().__init__()
         """
@@ -57,17 +59,18 @@ class LoTDSDF(nn.Module):
         self.decoder_cfg = decoder_cfg
         self.use_tcnn_backend = use_tcnn_backend
         
+        self.sdf_scale = sdf_scale
         self.use_extra_embed = extra_pos_embed_cfg is not None
         self.radius_init = radius_init
         self.inside_out = inside_out
         self.geo_init_method = geo_init_method
         self.n_rgb_used_output = n_rgb_used_output
-        self.if_extrafeat_from_output = self.n_rgb_used_output > 0
+        self.is_extrafeat_from_output = self.n_rgb_used_output > 0
         self.clip_level_grad_ema_factor = clip_level_grad_ema_factor
-        self.if_clip_level_grad_ema = clip_level_grad_ema_factor > 0
+        self.should_clip_level_grad_with_ema = clip_level_grad_ema_factor > 0
 
         #------- LoTD encoding
-        if self.if_clip_level_grad_ema:
+        if self.should_clip_level_grad_with_ema:
             self.encoding_cfg.setdefault('clip_level_grad_ema_factor', self.clip_level_grad_ema_factor)
         if aabb is not None:
             self.encoding_cfg.update(aabb=aabb)
@@ -84,13 +87,13 @@ class LoTDSDF(nn.Module):
 
         #------- SDF decoder
         self.decoder_cfg.setdefault('use_tcnn_backend', self.use_tcnn_backend)
-        if self.if_extrafeat_from_output:
+        if self.is_extrafeat_from_output:
             self.n_rgb_used_extrafeat = self.n_rgb_used_output
             self.decoder, self.decoder_type = get_lotd_decoder(self.encoding.lod_meta, (1+self.n_rgb_used_output), n_extra_embed_ch=self.n_extra_embed, **self.decoder_cfg, dtype=self.dtype, device=self.device)
         else:
             self.n_rgb_used_extrafeat = self.encoding.out_features
             self.decoder, self.decoder_type = get_lotd_decoder(self.encoding.lod_meta, 1, n_extra_embed_ch=self.n_extra_embed ,**self.decoder_cfg, dtype=self.dtype, device=self.device)
-        if self.if_clip_level_grad_ema and (length:=len(list(self.decoder.parameters()))) > 0:
+        if self.should_clip_level_grad_with_ema and (length:=len(list(self.decoder.parameters()))) > 0:
             self.register_buffer(f'decoder_grad_ema', torch.ones([length], device=self.device, dtype=torch.float))
         
         if self.geo_init_method == 'geometric' or self.geo_init_method == 'pretrain_after_geometric':
@@ -103,10 +106,20 @@ class LoTDSDF(nn.Module):
         
         elif self.geo_init_method == 'zero_out' or self.geo_init_method == 'pretrain_after_zero_out':
             # NOTE: For lotd-annealing, set zero to non-active part of decoder input at start
-            start_level = self.encoding.annealer.start_level
-            start_n_feats = sum(self.encoding.lotd.level_n_feats[:start_level+1])
+            if self.encoding.annealer is not None:
+                start_level = self.encoding.annealer.start_level
+                start_n_feats = sum(self.encoding.lotd.level_n_feats[:start_level+1])
+            else:
+                start_level = 0
+                start_n_feats = 0
             with torch.no_grad():
-                nn.init.zeros_(self.decoder.layers[0].weight[:, start_n_feats:])
+                # for l in range(start_level, self.encoding.lotd.n_levels, 1):
+                #     self.encoding.get_level_param(l).zero_()
+                if isinstance(self.decoder, nn.Sequential):
+                    # [LoTDSelect, Decoder]
+                    nn.init.zeros_(self.decoder[1].layers[0].weight[:, start_n_feats:])
+                else:
+                    nn.init.zeros_(self.decoder.layers[0].weight[:, start_n_feats:])
         
         self.register_buffer('is_pretrained', torch.tensor([False], dtype=torch.bool), persistent=True)
 
@@ -131,7 +144,7 @@ class LoTDSDF(nn.Module):
             output = self.decoder(torch.cat([h, h_embed.to(h.dtype)], dim=-1))
         sdf = output[..., 0]
         if return_h:
-            if self.if_extrafeat_from_output:
+            if self.is_extrafeat_from_output:
                 h = output[..., 1:]
             return dict(sdf=sdf, h=h)
         else:
@@ -183,12 +196,16 @@ class LoTDSDF(nn.Module):
                 nablas_extra = autograd.grad(h_embed, x, dL_dh_embed, retain_graph=has_grad, create_graph=nablas_has_grad, only_inputs=True)[0]
             nablas = nablas + nablas_extra
         
-        if self.if_extrafeat_from_output: h = output[..., 1:]
+        if self.is_extrafeat_from_output: h = output[..., 1:]
         if not nablas_has_grad:
             nablas = nablas.detach()
         if not has_grad:
             sdf, h = sdf.detach(), h.detach()
-        return dict(sdf=sdf, h=h, nablas=(nablas / (self.space.shrink_scale)))
+        
+        # NOTE: The 'x' used to compute 'dydx' here is already in the normalized space of [-1,1]^3. 
+        #       Hence, the computed 'nablas' need to be divided by 'self.space.scale0' to obtain 'nablas' under the original input space.
+        # NOTE: Returned nablas are already in obj's coords & scale, not in network's coords & scale
+        return dict(sdf=sdf, h=h, nablas=(nablas * self.sdf_scale / self.space.scale0))
 
     def forward_in_obj(self, x: torch.Tensor, invalid_sdf: float = 1.1, return_h=False, with_normal=False) -> Dict[str, torch.Tensor]:
         """
@@ -244,7 +261,7 @@ class LoTDSDF(nn.Module):
             h = self.encoding(x)
             output = self.decoder(h)
             sdf = output[..., 0]
-            if self.if_extrafeat_from_output: h = output[..., 1:]
+            if self.is_extrafeat_from_output: h = output[..., 1:]
             # NOTE: autograd.grad often introduces unecessary calculations that consume a lot of time 
             nablas = autograd.grad(sdf, x, torch.ones_like(sdf, device=x.device), create_graph=nablas_has_grad, retain_graph=has_grad, only_inputs=True)[0] # 450 ms; 15 ms after v1 fix
         if not has_grad:
@@ -261,7 +278,7 @@ class LoTDSDF(nn.Module):
             if not self.is_pretrained:
                 pretrain_sdf_sphere(
                     self, inside_out=self.inside_out, 
-                    target_radius=self.radius_init, aabb=self.space.aabb, 
+                    target_radius=self.radius_init, 
                     logger=logger, log_prefix=log_prefix, **config)
                 self.is_pretrained = ~self.is_pretrained
                 return True
@@ -305,7 +322,7 @@ class LoTDSDF(nn.Module):
     @torch.no_grad()
     def custom_grad_clip_step(self):
         self.encoding.custom_grad_clip_step()
-        if self.if_clip_level_grad_ema:
+        if self.should_clip_level_grad_with_ema:
             # Clip decoder's grad 
             # gnorm = torch.stack([p.grad.abs().max() for n,p in self.decoder.named_parameters() if p.grad is not None])
             gnorm = torch.stack([p.grad.norm() for n,p in self.decoder.named_parameters() if p.grad is not None])
@@ -317,14 +334,15 @@ class LoTDSDF(nn.Module):
                 clip_norm_(p.grad, val)
 
     @torch.no_grad()
-    def stat_param(self, with_grad=False, prefix="") -> Dict[str, float]:
+    def stat_param(self, with_grad=False, prefix: str='') -> Dict[str, float]:
+        prefix_ = prefix + ('.' if prefix and not prefix.endswith('.') else '')
         ret = {}
-        ret.update(self.encoding.stat_param(with_grad=with_grad, prefix=prefix+"encoding."))
-        ret.update({prefix + f'decoder.total.{k}' : v for k,v in tensor_statistics(torch.cat([p.data.flatten() for p in self.decoder.parameters()])).items()})
-        ret.update({prefix + f"decoder.{n}.{k}": v for n, p in self.decoder.named_parameters() for k, v in tensor_statistics(p.data).items()})
+        ret.update(self.encoding.stat_param(with_grad=with_grad, prefix=prefix_ + "encoding"))
+        ret.update({prefix_ + f'decoder.total.{k}' : v for k,v in tensor_statistics(torch.cat([p.data.flatten() for p in self.decoder.parameters()])).items()})
+        ret.update({prefix_ + f"decoder.{n}.{k}": v for n, p in self.decoder.named_parameters() for k, v in tensor_statistics(p.data).items()})
         if with_grad:
-            ret.update({prefix + f'decoder.grad.total.{k}': v for k, v in tensor_statistics(torch.cat([p.grad.data.flatten() for p in self.decoder.parameters() if p.grad is not None])).items()})
-            ret.update({prefix + f"decoder.grad.{n}.{k}": v for n, p in self.decoder.named_parameters() if p.grad is not None for k, v in  tensor_statistics(p.grad.data).items() })
-        if self.if_clip_level_grad_ema:
-            ret.update({prefix + f"decoder.grad.{n}.ema" : self.decoder_grad_ema[i].item() for i,(n,_) in enumerate(self.decoder.named_parameters())})
+            ret.update({prefix_ + f'decoder.grad.total.{k}': v for k, v in tensor_statistics(torch.cat([p.grad.data.flatten() for p in self.decoder.parameters() if p.grad is not None])).items()})
+            ret.update({prefix_ + f"decoder.grad.{n}.{k}": v for n, p in self.decoder.named_parameters() if p.grad is not None for k, v in  tensor_statistics(p.grad.data).items() })
+        if self.should_clip_level_grad_with_ema:
+            ret.update({prefix_ + f"decoder.grad.{n}.ema" : self.decoder_grad_ema[i].item() for i,(n,_) in enumerate(self.decoder.named_parameters())})
         return ret

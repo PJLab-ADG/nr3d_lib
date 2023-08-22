@@ -9,7 +9,7 @@ import itertools
 import numpy as np
 from numbers import Number
 from fractions import Fraction
-from typing import Iterable, List, Tuple, Union
+from typing import Iterable, List, Literal, Tuple, Union
 
 from matplotlib import cm
 
@@ -87,11 +87,16 @@ gold = (1.0, 0.804, 0.0)
 #         lower_bin + 1] * alphas.reshape(-1, 1)
 #     return colors.reshape(depths.shape[0], depths.shape[1], 3).astype(np.uint8)
 
-def color_depth(depths, scale=None, cmap='viridis'):
+def color_depth(depths: np.ndarray, scale=None, cmap='viridis', out: Literal['uint8,0,255', 'float,0,1']='uint8,0,255'):
     if scale is None:
         scale = depths.max()+1e-10
-    return np.clip(((cm.get_cmap(cmap)(depths/scale)[...,:3])*255.).astype(np.uint8), 0, 255)
-
+    colors = cm.get_cmap(cmap)(depths/scale)[...,:3]
+    if out == 'uint8,0,255':
+        return  np.clip(((colors)*255.).astype(np.uint8), 0, 255)
+    elif out == 'float,0,1':
+        return colors
+    else:
+        raise RuntimeError(f"Invalid out={out}")
 
 #---------------------------------------------
 #--------     Color ind map     ------------

@@ -9,7 +9,7 @@ import math
 import numbers
 import numpy as np
 from tqdm import tqdm
-from typing import Callable, Dict, Iterable, Union
+from typing import Callable, Dict, Iterable, List, Union
 
 import torch
 import torch.nn as nn
@@ -270,7 +270,9 @@ def get_scheduler(config: ConfigDict, optimizer, last_epoch: int=-1):
         raise NotImplementedError
     return scheduler
 
-def get_param_group(model: nn.Module, optim_cfg: Union[numbers.Number, dict], prefix: str=''):
+def get_param_group(
+    model: nn.Module, optim_cfg: Union[numbers.Number, dict], prefix: str=''
+    ) -> List[dict]:
     """ Pack model parameters into parameter group(s) with given `optim_cfg`
     
     Supported types input `optim_cfg`:

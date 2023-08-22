@@ -226,7 +226,7 @@ class DenseLayer(nn.Module):
     def __init__(
         self, 
         in_features: int, out_features: int, *,
-        bias: bool=True, activation: Union[str, dict, nn.Module]=None, if_init=True, 
+        bias: bool=True, activation: Union[str, dict, nn.Module]=None, should_init=True, 
         # For equal lr
         equal_lr=False, lr_mul: float=1, weight_init: float=1, bias_init: float=1, 
         # Factory_kwargs
@@ -238,7 +238,7 @@ class DenseLayer(nn.Module):
             out_features (int): Output feature width.
             bias (bool, optional): Whether hidden layers have bias. Defaults to True.
             activation (Union[str, dict, nn.Module], optional): Can be a name, a config dict, or a nn.Module. Defaults to None.
-            if_init (bool, optional): Whether conduct dense layer initialization. Defaults to True.
+            should_init (bool, optional): Whether conduct dense layer initialization. Defaults to True.
             equal_lr (bool, optional): Whether use `equal_lr`. Defaults to False.
             lr_mul (float, optional): equal_lr's multiplication factor. Defaults to 1.
             weight_init (float, optional): weight init mul factor. Defaults to 1.
@@ -267,7 +267,7 @@ class DenseLayer(nn.Module):
         self.activation = activation
 
         # Init parameters
-        if if_init:
+        if should_init:
             if equal_lr:
                 bound = weight_init / lr_mul
                 init.uniform_(self.weight, -bound, bound)

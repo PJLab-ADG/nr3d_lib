@@ -17,6 +17,7 @@ from torch.utils.benchmark import Timer
 from nr3d_lib.logger import Logger
 from nr3d_lib.config import ConfigDict
 
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.spatial import AABBSpace
 from nr3d_lib.models.spatial_accel import get_accel
 
@@ -25,7 +26,7 @@ from nr3d_lib.render.volume_graphics import packed_alpha_to_vw, ray_alpha_to_vw,
 
 
 __all__ = [
-    'nerf_distant_renderer_mixin'
+    'NeRFDistantRendererMixin'
 ]
 
 def ray_sphere_intersect(rays_o: torch.Tensor, rays_d: torch.Tensor, r: Union[float, torch.Tensor]) -> torch.Tensor:
@@ -84,11 +85,29 @@ def ray_box_intersect(rays_o: torch.Tensor, rays_d: torch.Tensor, r: Union[float
 
 named_tuple_nerfpp_raymarch_ret = namedtuple("nerfpp_raymarch_ret", "ridx_hit samples depth_samples deltas ridx pack_infos")
 
-class nerf_distant_renderer_mixin:
+class NeRFDistantRendererMixin(ModelMixin):
     def __init__(
-        self, radius_scale_min: float, radius_scale_max: float, 
-        include_inf_distance: bool = None, accel_cfg: ConfigDict = None, 
+        self, 
+        # Renderer mixin kwargs
+        ray_query_cfg: ConfigDict = ConfigDict(), 
+        accel_cfg: ConfigDict = None, 
+        radius_scale_min: float = 1.0, 
+        radius_scale_max: float = 100.0, 
+        include_inf_distance: bool = None, 
+        # Network kwargs
+        **net_kwargs
         ) -> None:
+        
+        mro = type(self).mro()
+        super_class = mro[mro.index(NeRFDistantRendererMixin)+1]
+        assert super_class is not ModelMixin, "Incorrect class inheritance. Three possible misuse scenarios:\n"\
+            "Case 1: The Net class for mixin should also inherit from `ModelMixin`.\n"\
+            "Case 2: RendererMixin should come before the Net class when inheriting.\n"\
+            "Case 3: You should not directly instantiate this mixin class."
+        
+        super().__init__(**net_kwargs) # Will call network's __init__() (e.g. LoTDNeRF ...)  
+        
+        self.ray_query_cfg = ray_query_cfg
         self.accel_cfg = accel_cfg
         self.radius_scale_min = radius_scale_min
         self.radius_scale_max = radius_scale_max
@@ -124,22 +143,20 @@ class nerf_distant_renderer_mixin:
         return ret
 
     def preprocess_per_train_step(self, cur_it: int, logger: Logger = None):
-        if hasattr(super(), 'preprocess_per_train_step'):
-            super().preprocess_per_train_step(cur_it, logger=logger)
+        super().preprocess_per_train_step(cur_it, logger=logger)
         if self.accel:
             # NOTE: Important to ignore update when query!
             self.accel.preprocess_per_train_step(
                 cur_it, lambda x: self.forward_sigma(x, ignore_update=True)['sigma'], logger)
 
     def postprocess_per_train_step(self, cur_it: int, logger: Logger = None):
-        if hasattr(super(), 'postprocess_per_train_step'):
-            super().postprocess_per_train_step(cur_it, logger=logger)
+        super().postprocess_per_train_step(cur_it, logger=logger)
         if self.accel:
             # NOTE: Important to ignore update when query!
             self.accel.postprocess_per_train_step(
                 cur_it, lambda x: self.forward_sigma(x, ignore_update=True)['sigma'], logger)
 
-    def ray_test(self, rays_o: torch.Tensor, rays_d: torch.Tensor, near=None, far=None, **extra_ray_shaped):
+    def ray_test(self, rays_o: torch.Tensor, rays_d: torch.Tensor, near=None, far=None, **extra_ray_data):
         raise NotImplementedError
         assert (rays_o.dim() == 2) and (rays_d.dim() == 2), \
             "Expect rays_o and rays_d to be of shape [N, 3]"
@@ -363,30 +380,27 @@ class nerf_distant_renderer_mixin:
         # function config
         return_buffer=False, return_details=False, render_per_obj=False):
         """ Query the model with input rays. 
-            Conduct the core ray sampling, ray marching, ray upsampling and network query procudures.
+            Conduct the core ray sampling, ray marching, ray upsampling and network query operations.
 
         Args:
-            ray_input (Dict[str, torch.Tensor], optional): All input rays. A dict composed of:
-                rays_o: [num_total_rays, 3]
-                rays_d: [num_total_rays, 3]
-                near:   [num_total_rays] tensor or float or None
-                far:    [num_total_rays] tensor or float or None
+            ray_input (Dict[str, torch.Tensor], optional): All input rays.
+                See more details in `ray_test`
             ray_tested (Dict[str, torch.Tensor], optional): Tested rays (Typicallly those that intersect with objects). A dict composed of:
                 num_rays:   int, Number of tested rays
                 ray_inds:   [num_rays] tensor, ray indices in `num_total_rays` of the tested rays
-                rays_o:     [num_rays, 3]
-                rays_d:     [num_rays, 3]
-                near:       [num_rays] tensor or float or None
-                far:        [num_rays] tensor or float or None
+                rays_o:     [num_rays, 3] tensor, the indexed and scaled rays' origin
+                rays_d:     [num_rays, 3] tensor, the indexed and scaled rays' direction
+                near:       [num_rays] tensor, entry depth of intersection
+                far:        [num_rays] tensor, exit depth of intersection
             config (ConfigDict, optional): Config of ray_query. Defaults to ConfigDict().
             return_buffer (bool, optional): If return the queried volume buffer. Defaults to False.
             return_details (bool, optional): If return training / debugging related details. Defaults to False.
             render_per_obj (bool, optional): If return single object / seperate volume rendering results. Defaults to False.
 
         Returns:
-            nested dict, The queried results, including 'volume_buffer', 'details', 'rendered'.
+            nested dict: The queried results, including 'volume_buffer', 'details', 'rendered'.
             
-            ['volume_buffer'] dict, The queried volume buffer. Available if `return_buffer` is set True.
+            ['volume_buffer']: dict, The queried volume buffer. Available if `return_buffer` is set True.
                 For now, two types of buffers might be queried depending on the ray sampling algorithms, 
                     namely `batched` buffers and `packed` buffers.
                 
@@ -399,8 +413,9 @@ class nerf_distant_renderer_mixin:
                         'ray_inds_hit':     [num_rays_hit] tensor, ray indices in `num_total_rays` of the hit & queried rays
                         't':                [num_rays_hit, num_samples_per_ray] batched tensor, real depth of the queried samples
                         'opacity_alpha':    [num_rays_hit, num_samples_per_ray] batched tensor, the queried alpha-values
-                        'rgb':              [num_rays_hit, num_samples_per_ray] batched tensor, optional, the queried rgb values
-                        'feature':          [num_rays_hit, num_samples_per_ray] batched tensor, optional, the queried features
+                        'rgb':              [num_rays_hit, num_samples_per_ray, 3] packed tensor, optional, the queried rgb values (Only if `with_rgb` is True)
+                        'nablas':           [num_rays_hit, num_samples_per_ray, 3] packed tensor, optional, the queried nablas values (Only if `with_normal` is True)
+                        'feature':          [num_rays_hit, num_samples_per_ray, with_feature_dim] batched tensor, optional, the queried features (Only if `with_feature_dim` > 0)
                     }
                 
                 An example `packed` buffer:
@@ -410,19 +425,21 @@ class nerf_distant_renderer_mixin:
                         'pack_infos_hit'    [num_rays_hit, 2] tensor, pack infos of the queried packed tensors
                         't':                [num_packed_samples] packed tensor, real depth of the queried samples
                         'opacity_alpha':    [num_packed_samples] packed tensor, the queried alpha-values
-                        'rgb':              [num_packed_samples] packed tensor, optional, the queried rgb values
-                        'feature':          [num_packed_samples] packed tensor, optional, the queried features
+                        'rgb':              [num_packed_samples, 3] packed tensor, optional, the queried rgb values (Only if `with_rgb` is True)
+                        'nablas':           [num_packed_samples, 3] packed tensor, optional, the queried nablas values (Only if `with_normal` is True)
+                        'feature':          [num_packed_samples, with_feature_dim] packed tensor, optional, the queried features (Only if `with_feature_dim` > 0)
                     }
 
-            ['details'] nested dict, Details for training. Available if `return_details` is set True.
+            ['details']: nested dict, Details for training. Available if `return_details` is set True.
             
-            ['rendered'] dict, stand-alone rendered results. Available if `render_per_obj` is set True.
+            ['rendered']: dict, stand-alone rendered results. Available if `render_per_obj` is set True.
                 An example rendered dict:
                     'rendered' {
                         'mask_volume':      [num_total_rays,] The rendered opacity / occupancy, in range [0,1]
                         'depth_volume':     [num_total_rays,] The rendered real depth
-                        'rgb_volume':       [num_total_rays, 3] The rendered rgb, in range [0,1]
-                        'normals_volume':   [num_total_rays, 3] The rendered normals, in range [-1,1]
+                        'rgb_volume':       [num_total_rays, 3] The rendered rgb, in range [0,1] (Only if `with_rgb` is True)
+                        'normals_volume':   [num_total_rays, 3] The rendered normals, in range [-1,1] (Only if `with_normal` is True)
+                        'feature_volume':   [num_total_rays, with_feature_dim] The rendered feature. (Only if `with_feature_dim` > 0)
                     }
         """
 
@@ -465,7 +482,7 @@ class nerf_distant_renderer_mixin:
         #----------------
         # Ray query
         #----------------
-        if query_mode == 'only_raymarch':
+        if query_mode == 'march_occ':
             volume_buffer = self._ray_query_march_occ(
                 ray_tested, with_rgb=with_rgb, perturb=config.perturb, **config.query_param)
         else:

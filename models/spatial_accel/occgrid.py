@@ -1,5 +1,5 @@
 """
-@file   occ_grid.py
+@file   occgrid.py
 @author Jianfei Guo, Shanghai AI Lab
 @brief  Occupancy memory and updater.
 """
@@ -42,6 +42,8 @@ def sdf_to_occ(sdf: torch.Tensor, *, inv_s: float = None, inv_s_anneal_cfg: Conf
 def get_occ_val_fn(type: Literal['sdf', 'density', 'occ'] = 'sdf', **kwargs):
     if type == 'sdf':
         return functools.partial(sdf_to_occ, **kwargs)
+    elif type == "raw_sdf":
+        return lambda sdf: 1.0 - torch.abs(sdf)
     elif type == 'occ':
         return nn.Identity()
     elif type == 'density':
@@ -104,7 +106,7 @@ class OccupancyGridEMA(nn.Module):
         self, 
         resolution: Union[int, List[int], torch.Tensor] = 128,
         occ_val_fn_cfg=ConfigDict(type='density'), occ_val_fn = None, occ_thre: float = 0.01, 
-        consider_mean=False, # Whether consider average value as threshold when binarizing occ_val
+        occ_thre_consider_mean=False, # Whether consider average value as threshold when binarizing occ_val
         ema_decay: float = 0.95, n_steps_between_update: int = 16, n_steps_warmup: int = 256,
         init_cfg=ConfigDict(), acquire_from_net_cfg = ConfigDict(), acquire_from_samples_cfg = ConfigDict(),
         dtype=torch.float, device=torch.device('cuda')) -> None:
@@ -134,16 +136,16 @@ class OccupancyGridEMA(nn.Module):
         self.init_cfg = init_cfg
         self.acquire_from_net_cfg = acquire_from_net_cfg
         self.acquire_from_samples_cfg = acquire_from_samples_cfg
-        self.if_gather_samples: bool = acquire_from_samples_cfg is not None
+        self.should_gather_samples: bool = acquire_from_samples_cfg is not None
         
         self.occ_thre = occ_thre
         self.occ_val_fn = get_occ_val_fn(**occ_val_fn_cfg) if occ_val_fn is None else occ_val_fn
-        self.consider_mean = consider_mean
+        self.occ_thre_consider_mean = occ_thre_consider_mean
         
         self.n_steps_between_update = n_steps_between_update
         self.n_steps_warmup = n_steps_warmup
         
-        if self.if_gather_samples:
+        if self.should_gather_samples:
             # To gather samples collected during forward & uniform sampling; and use them to update when it's time to update.
             self.register_buffer('_occ_val_grid_pcl', torch.zeros(resolution.tolist(), dtype=self.dtype, device=self.device), persistent=False)
     
@@ -193,7 +195,7 @@ class OccupancyGridEMA(nn.Module):
         """
         NOTE: `gather_samples` should be invoked like a forward-hook function.
         """
-        if self.training and self.if_gather_samples:
+        if self.training and self.should_gather_samples:
             self._gather_samples(pts, val, **self.acquire_from_samples_cfg)
 
     @torch.no_grad()
@@ -225,20 +227,26 @@ class OccupancyGridEMA(nn.Module):
             pts = ((gidx[:,None,:] + offsets) / self.resolution).view(-1,3) * 2 - 1
         return pts
 
+    @torch.no_grad()
+    def sample_pts_in_occupied(self, num_pts: int):
+        gidx_nonempty = self.occ_grid.nonzero().long() 
+        assert gidx_nonempty.numel() > 0, "Occupancy grid becomes empty during training. Your model/algorithm/training settings might be incorrect. Please check configs and tensorboard."
+        
+        return self._sample_pts_selected(gidx_nonempty, num_pts)
+
     # if constant_value is not None:
     #     self.occ_val_grid.fill_(constant_value)
-    #     self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+    #     self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
     #     return
 
     @torch.no_grad()
     def _init_constant(self, constant_value: float):
         self.occ_val_grid.fill_(constant_value)
-        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
 
     @torch.no_grad()
-    def _init_from_net(
-        self, val_query_fn, *, num_steps=4, num_pts: int=2**18):
-        for _ in range(num_steps):
+    def _init_from_net(self, val_query_fn, *, num_steps=4, num_pts: int=2**18):
+        for _ in trange(num_steps, desc="Init OCC", leave=False):
             # Sample in non-occupied voxels only (usally its all voxels at the first round).
             gidx_empty = self.occ_grid.logical_not().nonzero().long()
             if gidx_empty.shape[0] > 0:
@@ -246,13 +254,13 @@ class OccupancyGridEMA(nn.Module):
                 val = val_query_fn(pts)
                 # No ema here. (ema=1.0)
                 update_occ_val_grid_(self.occ_val_grid, pts, self.occ_val_fn(val), ema_decay=1.0)
-                self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+                self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
 
     @torch.no_grad()
     def _update_grids_per_iter(self, pts: torch.Tensor, val: torch.Tensor):
         pts, occ_val = pts.flatten(0, -2), self.occ_val_fn(val.flatten())
         gidx = ((pts/2. + 0.5) * self.resolution).long().clamp(self.resolution.new_tensor([0]), self.resolution-1)
-        if self.if_gather_samples:
+        if self.should_gather_samples:
             idx_pcl = self._occ_val_grid_pcl.nonzero().long()
             if idx_pcl.numel() > 0:
                 occ_val_pcl = self._occ_val_grid_pcl[tuple(idx_pcl.t())]
@@ -260,7 +268,7 @@ class OccupancyGridEMA(nn.Module):
                 occ_val = torch.cat([occ_val, occ_val_pcl], dim=0)
             self._occ_val_grid_pcl.zero_()
         update_occ_val_grid_idx_(self.occ_val_grid, gidx, occ_val, ema_decay=self.ema_decay)
-        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
 
     @torch.no_grad()
     def _update_from_net_per_iter(
@@ -281,7 +289,7 @@ class OccupancyGridEMA(nn.Module):
             
             gidx_nonempty = self.occ_grid.nonzero().long() 
             gidx_empty = self.occ_grid.logical_not().nonzero().long() 
-            assert gidx_nonempty.numel() > 0, "Occupancy grid becomes empty during training. Your model/algorithm/training setting might be incorrect. Please check."
+            assert gidx_nonempty.numel() > 0, "Occupancy grid becomes empty during training. Your model/algorithm/training settings might be incorrect. Please check configs and tensorboard."
             
             for _ in range(num_steps):
                 pts1 = self._sample_pts_uniform(n_uniform)
@@ -338,7 +346,7 @@ class OccupancyGridEMA(nn.Module):
 
         #----------- Set new occ_val grid
         self.occ_val_grid = occ_val_grid_new
-        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
 
     @torch.no_grad()
     def query(self, pts: torch.Tensor):
@@ -352,7 +360,7 @@ class OccupancyGridEMABatched(nn.Module):
         self, num_batches: int, # Number of occ_grid 
         resolution: Union[int, List[int], torch.Tensor] = 128,
         occ_val_fn_cfg=ConfigDict(type='density'), occ_val_fn = None, occ_thre: float = 0.01, 
-        consider_mean=False, # Whether consider average value as threshold when binarizing occ_val
+        occ_thre_consider_mean=False, # Whether consider average value as threshold when binarizing occ_val
         ema_decay: float = 0.95, n_steps_between_update: int = 16, n_steps_warmup: int = 256,
         init_cfg=ConfigDict(), acquire_from_net_cfg=ConfigDict(), acquire_from_samples_cfg=ConfigDict(),
         dtype=torch.float, device=torch.device('cuda')
@@ -384,16 +392,16 @@ class OccupancyGridEMABatched(nn.Module):
         self.init_cfg = init_cfg
         self.acquire_from_net_cfg = acquire_from_net_cfg
         self.acquire_from_samples_cfg = acquire_from_samples_cfg
-        self.if_gather_samples: bool = acquire_from_samples_cfg is not None
+        self.should_gather_samples: bool = acquire_from_samples_cfg is not None
         
         self.occ_thre = occ_thre
         self.occ_val_fn = get_occ_val_fn(**occ_val_fn_cfg) if occ_val_fn is None else occ_val_fn
-        self.consider_mean = consider_mean
+        self.occ_thre_consider_mean = occ_thre_consider_mean
         
         self.n_steps_between_update = n_steps_between_update
         self.n_steps_warmup = n_steps_warmup
         
-        if self.if_gather_samples:
+        if self.should_gather_samples:
             # To gather samples collected during forward & uniform sampling; and use them to update when it's time to update.
             self.register_buffer('_occ_val_grid_pcl', torch.zeros([num_batches, *resolution.tolist()], dtype=self.dtype, device=self.device), persistent=False)
 
@@ -442,7 +450,7 @@ class OccupancyGridEMABatched(nn.Module):
         """
         NOTE: `gather_samples` should be invoked like a forward-hook function.
         """
-        if self.training and self.if_gather_samples:
+        if self.training and self.should_gather_samples:
             self._gather_samples(pts.flatten(0,-2), bidx.flatten(), val.flatten(), **self.acquire_from_samples_cfg)
 
     @torch.no_grad()
@@ -489,7 +497,7 @@ class OccupancyGridEMABatched(nn.Module):
     @torch.no_grad()
     def _init_constant(self, constant_value: float):
         self.occ_val_grid.fill_(constant_value)
-        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
 
     @torch.no_grad()
     def _init_from_net(
@@ -505,11 +513,11 @@ class OccupancyGridEMABatched(nn.Module):
                 val = val_query_fn_normalized_x_with_bidx(pts, bidx)
                 # No ema here. (ema=1.0)
                 update_batched_occ_val_grid_(self.occ_val_grid, pts, bidx, self.occ_val_fn(val), ema_decay=1.0)
-                self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+                self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
 
     @torch.no_grad()
     def _update_grids_per_iter(self, pts: torch.Tensor, bidx: torch.Tensor = None, val: torch.Tensor = ...):
-        if self.if_gather_samples:
+        if self.should_gather_samples:
             idx_pcl_all = self._occ_val_grid_pcl.nonzero().long()
             if idx_pcl_all.numel() > 0:
                 bidx_pcl, gidx_pcl = idx_pcl_all[..., 0], idx_pcl_all[..., 1:]
@@ -533,14 +541,14 @@ class OccupancyGridEMABatched(nn.Module):
             pts, occ_val = pts.flatten(1, -2), self.occ_val_fn(val).flatten(1, -1)
             gidx = ((pts/2. + 0.5) * self.resolution).long().clamp(self.resolution.new_tensor([0]), self.resolution-1)
             if bidx_pcl is not None:
-                # if_gather_samples, change batched mode to non-batched mode by calculating an auxillary bidx
+                # should_gather_samples, change batched mode to non-batched mode by calculating an auxillary bidx
                 bidx = torch.arange(self.num_batches, device=self.device).view(-1,1).expand(-1, pts.shape[1]).reshape(-1)
                 bidx = torch.cat([bidx, bidx_pcl], dim=0)
                 gidx = torch.cat([gidx.view(-1,3), gidx_pcl], dim=0)
                 occ_val = torch.cat([occ_val.view(-1), occ_val_pcl], dim=0)
 
         update_batched_occ_val_grid_idx_(self.occ_val_grid, bidx, gidx, occ_val, ema_decay=self.ema_decay)
-        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.consider_mean)
+        self.occ_grid = binarize(self.occ_val_grid, self.occ_thre, self.occ_thre_consider_mean)
 
     @torch.no_grad()
     def _update_from_net_per_iter(
@@ -594,7 +602,7 @@ class OccupancyGridGetter(nn.Module):
         self, 
         resolution: Union[int, List[int], torch.Tensor] = 128,
         occ_val_fn_cfg=ConfigDict(type='density'), occ_val_fn = None, occ_thre: float = 0.01, 
-        consider_mean=False, # Whether consider average value as threshold when binarizing occ_val
+        occ_thre_consider_mean=False, # Whether consider average value as threshold when binarizing occ_val
         num_steps=4, num_pts_per_batch: int=2**18, 
         num_pts: int = None,
         dtype=torch.float, device=torch.device('cuda')
@@ -623,7 +631,7 @@ class OccupancyGridGetter(nn.Module):
 
         self.occ_thre = occ_thre
         self.occ_val_fn = get_occ_val_fn(**occ_val_fn_cfg) if occ_val_fn is None else occ_val_fn
-        self.consider_mean = consider_mean
+        self.occ_thre_consider_mean = occ_thre_consider_mean
 
         self.num_steps = num_steps
         self.num_pts = num_pts
@@ -642,7 +650,7 @@ class OccupancyGridGetter(nn.Module):
             pts = ((grid_coords[:,None,:] + offsets) / self.resolution) * 2 -1
             val = val_query_fn(pts)
             occ_val = self.occ_val_fn(val.flatten()).view(grid_coords.shape[0], n_per_vox)
-            occ_grid_iter = binarize(occ_val, self.occ_thre, self.consider_mean).any(dim=-1).view(self.resolution.tolist())
+            occ_grid_iter = binarize(occ_val, self.occ_thre, self.occ_thre_consider_mean).any(dim=-1).view(self.resolution.tolist())
             occ_grid |= occ_grid_iter
         return occ_grid
 
@@ -672,7 +680,7 @@ class OccupancyGridGetter(nn.Module):
             # [(1)*(2)*1, (2)*1, 1]
             idx_ravel = (idx * idx.new_tensor([resolution[1] * resolution[2], resolution[2], 1])).sum(-1)
             occ_val_grid_iter, _ = scatter_max(occ_val, idx_ravel, dim=0, dim_size=prod(occ_grid.shape))
-            occ_grid |= binarize(occ_val_grid_iter, self.occ_thre, self.consider_mean).view(occ_grid.shape)
+            occ_grid |= binarize(occ_val_grid_iter, self.occ_thre, self.occ_thre_consider_mean).view(occ_grid.shape)
         return occ_grid
 
     @torch.no_grad()
@@ -688,7 +696,7 @@ class OccupancyGridGetter(nn.Module):
             pts = ((grid_coords[None,:,None,:] + offsets) / self.resolution) * 2 -1
             val = val_query_fn_batched(pts)
             occ_val = self.occ_val_fn(val.flatten()).view(grid_coords.shape[0], n_per_vox)
-            occ_grid_iter = binarize(occ_val, self.occ_thre, self.consider_mean).any(dim=-1).view(occ_grid.shape)
+            occ_grid_iter = binarize(occ_val, self.occ_thre, self.occ_thre_consider_mean).any(dim=-1).view(occ_grid.shape)
             occ_grid |= occ_grid_iter
         return occ_grid
 
@@ -717,7 +725,7 @@ class OccupancyGridGetter(nn.Module):
             # [(0)*(1)*(2)*1, (1)*(2)*1, (2)*1, 1]
             idx_ravel = (idx * idx.new_tensor([prod(resolution), resolution[1] * resolution[2], resolution[2], 1])).sum(-1)
             occ_val_grid_iter, _ = scatter_max(occ_val, idx_ravel, dim=0, dim_size=prod(occ_grid.shape))
-            occ_grid |= binarize(occ_val_grid_iter, self.occ_thre, self.consider_mean).view(occ_grid.shape)
+            occ_grid |= binarize(occ_val_grid_iter, self.occ_thre, self.occ_thre_consider_mean).view(occ_grid.shape)
         return occ_grid
 
 if __name__ == "__main__":

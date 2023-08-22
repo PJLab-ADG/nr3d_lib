@@ -15,7 +15,7 @@ Recorded differences between the two up to now:
 
 __all__ = [
     'MlpPENeuS', 
-    'MlpPENeuSFramework'
+    'MlpPENeuSModel'
 ]
 
 import numpy as np
@@ -29,20 +29,21 @@ from nr3d_lib.logger import Logger
 from nr3d_lib.config import ConfigDict
 from nr3d_lib.utils import tensor_statistics, torch_dtype
 
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.annealers import get_annealer
 from nr3d_lib.models.fields.sdf import MlpPESDF
 from nr3d_lib.models.fields.nerf import RadianceNet
 from nr3d_lib.models.fields.neus.variance import get_neus_var_ctrl
-from nr3d_lib.models.fields.neus.renderer_mixin import neus_renderer_mixin
+from nr3d_lib.models.fields.neus.renderer_mixin import NeusRendererMixin
 
-class MlpPENeuS(nn.Module):
+class MlpPENeuS(ModelMixin, nn.Module):
     def __init__(
         self,
-        var_ctrl_cfg: ConfigDict = ConfigDict(ln_inv_s_init=0.3, ln_inv_s_factor=10.0), 
-        surface_cfg: ConfigDict = ConfigDict(),
-        radiance_cfg: ConfigDict = None,
-        cos_anneal_cfg: ConfigDict = None,
-        dtype=torch.float, device=torch.device("cuda"), use_tcnn_backend=False
+        surface_cfg: ConfigDict,
+        var_ctrl_cfg: ConfigDict=ConfigDict(ln_inv_s_init=0.3, ln_inv_s_factor=10.0), 
+        radiance_cfg: ConfigDict=None,
+        cos_anneal_cfg: ConfigDict=None,
+        dtype=torch.float, device=torch.device("cuda"), use_tcnn_backend=False, 
         ) -> None:
         super().__init__()
         self.dtype = torch_dtype(dtype)
@@ -103,15 +104,13 @@ class MlpPENeuS(nn.Module):
         return self.implicit_surface.space
 
     def preprocess_model(self):
-        if hasattr(self.implicit_surface, 'preprocess_model'):
-            self.implicit_surface.preprocess_model()
+        self.implicit_surface.preprocess_model()
 
     def preprocess_per_train_step(self, cur_it: int, logger: Logger = None):
         self.ctrl_var.set_iter(cur_it)
         if self.ctrl_cos_anneal is not None:
             self.ctrl_cos_anneal.set_iter(cur_it)
-        if hasattr(self.implicit_surface, 'preprocess_per_train_step'):
-            self.implicit_surface.preprocess_per_train_step(cur_it, logger=logger)
+        self.implicit_surface.preprocess_per_train_step(cur_it, logger=logger)
 
     def forward_inv_s(self):
         return self.ctrl_var()
@@ -158,14 +157,15 @@ class MlpPENeuS(nn.Module):
             return alpha_sdf * sdf_weight_reg
 
     @torch.no_grad()
-    def stat_param(self, with_grad=False, prefix='') -> Dict[str, float]:
+    def stat_param(self, with_grad=False, prefix: str='') -> Dict[str, float]:
+        prefix_ = prefix + ('.' if prefix and not prefix.endswith('.') else '')
         ret = {}
-        ret.update(self.implicit_surface.stat_param(with_grad=with_grad, prefix=prefix+''))
-        ret.update({prefix + f'radiance_net.total.{k}': v for k, v in tensor_statistics(torch.cat([p.data.flatten() for p in self.radiance_net.parameters()])).items()})
-        ret.update({prefix + f"radiance_net.{n}.{k}": v for n, p in self.radiance_net.named_parameters() for k, v in tensor_statistics(p.data).items()})
+        ret.update(self.implicit_surface.stat_param(with_grad=with_grad, prefix=prefix_ + "surface"))
+        ret.update({prefix_ + f'radiance_net.total.{k}': v for k, v in tensor_statistics(torch.cat([p.data.flatten() for p in self.radiance_net.parameters()])).items()})
+        ret.update({prefix_ + f"radiance_net.{n}.{k}": v for n, p in self.radiance_net.named_parameters() for k, v in tensor_statistics(p.data).items()})
         if with_grad:
-            ret.update({prefix + f'radiance_net.grad.total.{k}': v for k, v in tensor_statistics(torch.cat([p.grad.data.flatten() for p in self.radiance_net.parameters() if p.grad is not None])).items()})
-            ret.update({prefix + f"radiance_net.grad.{n}.{k}": v for n, p in self.radiance_net.named_parameters() if p.grad is not None for k, v in tensor_statistics(p.grad.data).items()})
+            ret.update({prefix_ + f'radiance_net.grad.total.{k}': v for k, v in tensor_statistics(torch.cat([p.grad.data.flatten() for p in self.radiance_net.parameters() if p.grad is not None])).items()})
+            ret.update({prefix_ + f"radiance_net.grad.{n}.{k}": v for n, p in self.radiance_net.named_parameters() if p.grad is not None for k, v in tensor_statistics(p.grad.data).items()})
         return ret
 
     # @torch.no_grad()
@@ -176,18 +176,11 @@ class MlpPENeuS(nn.Module):
     # def custom_grad_clip_step(self):
     #     self.implicit_surface.custom_grad_clip_step()
 
-# Rules of mixins:
-# - Mixin class name should come before model class name. 
-#   - So that a mixin's methods can override model's methods.
-#   - So that when overriding, mixin's methods could call super().xxx() to call model's methods
-# - Mixin's should init after model, because model's __init__ calls nn.Module.__init__
-# - Outside users will not need to care about the content of mixins (directly use already mixin-ed classes)
-# - If necessary, renderering or mixin methods can be directly implemented in own model class, instead of multiple inheritance (e.g. analytic tracing etc.)
-
-class MlpPENeuSFramework(neus_renderer_mixin, MlpPENeuS):
-    def __init__(self, *args, mixin_cfg=ConfigDict(), **kwargs) -> None:
-        MlpPENeuS.__init__(self, *args, **kwargs)
-        neus_renderer_mixin.__init__(self, **mixin_cfg) 
+class MlpPENeuSModel(NeusRendererMixin, MlpPENeuS):
+    """
+    MRO: NeusRendererMixin -> MlpPENeuS -> ModelMixin -> nn.Module
+    """
+    pass
 
 if __name__ == "__main__":
     def unit_test(device=torch.device('cuda')):

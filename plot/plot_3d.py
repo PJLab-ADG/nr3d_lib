@@ -21,6 +21,7 @@ __all__ = [
     'create_occ_grid_mesh',
     'create_occ_grid_mesh_o3d',
     'vis_spc_voxels_o3d',
+    'vis_occgrid_voxels_o3d', 
     'create_vox_grid_lines',
     'create_vox_grid_lineset_o3d',
     

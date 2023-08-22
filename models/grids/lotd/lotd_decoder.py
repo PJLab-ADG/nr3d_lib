@@ -33,15 +33,19 @@ TODO:
 
 def get_lotd_decoder(
     lod_meta, out_features: int, *, 
-    type: str = 'mlp', n_extra_embed_ch: int=0, level_select_n_feats: int = None, 
+    type: str = 'mlp', n_extra_embed_ch: int=0, 
+    level_select_n_feats: int = None, select_n_levels: int = None, 
     dtype=torch.float16, device=torch.device('cuda'), **params):
     
     dtype = torch_dtype(dtype)
-    if level_select_n_feats is None:
+    if (level_select_n_feats is None) and (select_n_levels is None):
         selector = None
         in_features = lod_meta.n_encoded_dims + n_extra_embed_ch
     else:
-        selector = LoTDSelect(lod_meta, level_select_n_feats, device=device)
+        selector = LoTDSelect(
+            lod_meta, device=device, 
+            level_select_n_feats=level_select_n_feats, 
+            select_n_levels=select_n_levels)
         in_features = selector.out_features
     
     if type == 'sum' or type == 'mean':
@@ -69,24 +73,35 @@ def get_lotd_decoder(
     return dec, type
 
 class LoTDSelect(nn.Module):
-    def __init__(self, lod_meta, level_select_n_feats: int, n_extra_embed_ch: int = 0, device=torch.device('cuda')) -> None:
+    def __init__(
+        self, lod_meta, 
+        level_select_n_feats: int = None, 
+        select_n_levels: int = None, 
+        n_extra_embed_ch: int = 0, 
+        device=torch.device('cuda')) -> None:
         super().__init__()
+        
+        assert bool(level_select_n_feats is not None) != bool(select_n_levels is not None), \
+            "Expect one of `level_select_n_feats` or `select_n_levels`"
         
         self.device = device
         self.n_extra_embed_ch = n_extra_embed_ch
         
         exclusive_sum = np.cumsum([0,*lod_meta.level_n_feats])
-        feat_inds = []
-        feat_n = []
-        for l, n in enumerate(lod_meta.level_n_feats):
-            level_n = min(level_select_n_feats, n)
-            inds = exclusive_sum[l] + torch.arange(level_n)
-            feat_n.append(feat_n)
-            feat_inds.append(inds)
-        feat_inds = torch.cat(feat_inds).to(device=device, dtype=torch.long)
+        if level_select_n_feats is not None:
+            feat_inds = []
+            feat_n = []
+            for l, n in enumerate(lod_meta.level_n_feats):
+                level_n = min(level_select_n_feats, n)
+                inds = exclusive_sum[l] + torch.arange(level_n)
+                feat_n.append(feat_n)
+                feat_inds.append(inds)
+            feat_inds = torch.cat(feat_inds).to(device=device, dtype=torch.long)
+        else:
+            feat_inds = torch.arange(exclusive_sum[select_n_levels], dtype=torch.long, device=device)
         
         self.register_buffer('feat_inds', feat_inds, persistent=True)
-        self.selected_level_n_feats = feat_n
+        # self.selected_level_n_feats = feat_n
         self.in_fearues = lod_meta.n_encoded_dims + self.n_extra_embed_ch
         self.out_features = len(feat_inds) + self.n_extra_embed_ch
     

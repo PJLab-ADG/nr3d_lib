@@ -23,8 +23,10 @@ class ImpSampler(nn.Module):
         n_images: int, error_res: Tuple[int, int],
         # image_res: Tuple[int, int], 
         *, 
-        uniform_sampling_fraction: float = 0.5, 
-        min_pdf: float = 0.01, max_n_steps: int = 1000, 
+        #---- PDF configs
+        min_pdf: float = 0.01, uniform_sampling_fraction: float = 0.5, 
+        #---- Update configs
+        n_steps_init: int = 128, n_steps_growth_factor: float = 1.5, n_steps_max: int = None, 
         device=torch.device('cuda'), dtype=torch.float
         ) -> None:
         """ Pixel importance sampling via 2D invert CDF sampling on accumulated error maps
@@ -32,8 +34,11 @@ class ImpSampler(nn.Module):
         Args:
             n_images (int): Number of images in the dataset.
             error_res (Tuple[int, int]): Resolution of the error map. Usually much coarser than the original image.
-            uniform_sampling_fraction (float, optional): A part of pixels use uniform sampling. Defaults to 0.5.
             min_pdf (float, optional): Minimum pdf value to prevent all zero or too small error maps. Defaults to 0.01.
+            uniform_sampling_fraction (float, optional): A part of pixels use uniform sampling. Defaults to 0.5.
+            n_steps_init (int, optional): The initial CDF update period (`n_steps_between_update`), in iters unit. Default is 128.
+            n_steps_growth_factor (float, optional): The growth factor of cdf update period of the next update w.r.t the previous one. Defaults to 1.5
+            n_steps_max (int, optional): The maximum cdf update period. If None, there is no limitations. Defaults to None.
             device (torch.device, optional): torch device of the error maps. Defaults to torch.device('cuda').
             dtype (torch.dtype, optional): torch dtype of the error maps. Defaults to torch.float.
         """
@@ -65,8 +70,9 @@ class ImpSampler(nn.Module):
         # Training update related
         #-------------------------------------
         self.n_steps_since_update = 0
-        self.n_steps_between_update = 128
-        # self.max_n_steps = max_n_steps
+        self.n_steps_growth_factor = n_steps_growth_factor
+        self.n_steps_between_update = n_steps_init
+        self.n_steps_max = n_steps_max
 
     @torch.no_grad()
     def update_error_map(self, i: Union[int, torch.LongTensor], xy: torch.Tensor, val: torch.Tensor):
@@ -120,6 +126,17 @@ class ImpSampler(nn.Module):
         """
         self.construct_cdf()
         self.error_map.zero_()
+
+    @torch.no_grad()
+    def step_error_map(self, i: Union[int, torch.LongTensor], xy: torch.Tensor, val: torch.Tensor):
+        self.update_error_map(i=i, xy=xy, val=val)
+        self.n_steps_since_update += 1
+        if self.n_steps_since_update >= self.n_steps_between_update:
+            self.construct_cdf_and_clean_error_map()
+            self.n_steps_since_update = 0
+            self.n_steps_between_update = int(self.n_steps_growth_factor * self.n_steps_between_update)
+            if self.n_steps_max is not None:
+                self.n_steps_between_update = min(self.n_steps_between_update, self.n_steps_max)
 
     @torch.no_grad()
     def _get_pdf_image(self) -> torch.Tensor:

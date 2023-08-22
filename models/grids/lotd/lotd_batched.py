@@ -125,11 +125,12 @@ class LoTDBatched(nn.Module):
                                                 max_level=(max_level or self.max_level))
 
     @torch.no_grad()
-    def stat_param(self, with_grad=False, prefix="") -> Dict[str, float]:
+    def stat_param(self, with_grad=False, prefix: str='') -> Dict[str, float]:
+        prefix_ = prefix + ('.' if prefix and not prefix.endswith('.') else '')
         ret = {}
-        ret.update({prefix + f"{n}.{k}": v for n, p in self.lotd_grower.named_parameters() for k, v in tensor_statistics(p.data).items()})
+        ret.update({prefix_ + f"{n}.{k}": v for n, p in self.lotd_grower.named_parameters() for k, v in tensor_statistics(p.data).items()})
         if with_grad:
-            ret.update({prefix + f"grad.{n}.{k}": v for n, p in self.lotd_grower.named_parameters() if p.grad is not None for k, v in  tensor_statistics(p.grad.data).items() })
+            ret.update({prefix_ + f"grad.{n}.{k}": v for n, p in self.lotd_grower.named_parameters() if p.grad is not None for k, v in  tensor_statistics(p.grad.data).items() })
         return ret
 
 class LoTDBatchedParamWrapper(object):

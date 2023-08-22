@@ -62,11 +62,16 @@ class BaseConfig:
     @staticmethod
     def _create_parser():
         parser = argparse.ArgumentParser()
-        parser.add_argument('--config', type=str, default=None, help='Path to config file.')
-        parser.add_argument('--resume_dir', type=str, default=None, help='Directory of experiment to load.')
-        parser.add_argument('--device_ids', type=str, default='0')
-        parser.add_argument('--ddp', action='store_true')
-        parser.add_argument('--port', type=int, default=None, help='master port for multi processing. (if used)')
+        parser.add_argument('--config', type=str, default=None, 
+                            help="Specifies the path to the config file. You should always specify one of --config or --resume_dir.")
+        parser.add_argument('--resume_dir', type=str, default=None, 
+                            help="Specifies the directory of the experiment to load/resume. You should always specify one of --config or --resume_dir.")
+        parser.add_argument('--device_ids', type=str, default='0', 
+                            help="Optionally, specify a target device id. "\
+                            "NOTE: Using the environment variable `CUDA_VISIBLE_DEVICES=x` is recommended, "\
+                            "as this argument is not always reliable.")
+        parser.add_argument('--ddp', action='store_true', help="[DEPRECATED] We discard DDP support for now.")
+        parser.add_argument('--port', type=int, default=None, help="[DEPRECATED] We discard DDP support for now.")
         return parser
         
     def parse(
@@ -221,7 +226,8 @@ def save_config(cfg: ConfigDict, path: str, ignore_fields=["ddp"]):
         if OmegaConf.is_config(datadict):
             outfile.write(OmegaConf.to_yaml(datadict, resolve=True))
         elif isinstance(datadict, ConfigDict):
-            yaml.dump(datadict.to_dict(), outfile, default_flow_style=False)
+            # NOTE: Set sort_keys to False to maintain key order, crucial for the sequence of model loading.
+            yaml.dump(datadict.to_dict(), outfile, default_flow_style=False, sort_keys=False)
         else:
             raise ValueError(f"Invalid cfg type = {type(datadict)}")
 

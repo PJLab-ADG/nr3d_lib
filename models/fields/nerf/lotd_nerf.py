@@ -6,7 +6,7 @@
 
 __all__ = [
     'LoTDNeRF', 
-    'LoTDNeRFFramework'
+    'LoTDNeRFModel'
 ]
 
 import torch
@@ -16,14 +16,16 @@ import torch.nn.functional as F
 from nr3d_lib.logger import Logger
 from nr3d_lib.utils import torch_dtype
 from nr3d_lib.config import ConfigDict
+from nr3d_lib.profile import profile
 
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.spatial import AABBSpace
 from nr3d_lib.models.embedders import get_embedder
 from nr3d_lib.models.fields.nerf.nerf import RadianceNet
 from nr3d_lib.models.grids.lotd import LoTDEncoding, get_lotd_decoder
-from nr3d_lib.models.fields.nerf.renderer_mixin import nerf_renderer_mixin
+from nr3d_lib.models.fields.nerf.renderer_mixin import NeRFRendererMixin
 
-class LoTDNeRF(nn.Module):
+class LoTDNeRF(ModelMixin, nn.Module):
     def __init__(
         self,
 
@@ -37,7 +39,7 @@ class LoTDNeRF(nn.Module):
         n_rgb_used_output: int = 0,
 
         dtype=torch.float16, device=torch.device("cuda"), use_tcnn_backend=False
-    ) -> None:
+        ) -> None:
         super().__init__()
         """
         n_rgb_used_output: 
@@ -49,7 +51,7 @@ class LoTDNeRF(nn.Module):
         self.dtype = torch_dtype(dtype)
         self.device = device
         self.n_rgb_used_output = n_rgb_used_output
-        self.if_extrafeat_from_output = n_rgb_used_output > 0
+        self.is_extrafeat_from_output = n_rgb_used_output > 0
         self.use_extra_embed = extra_pos_embed_cfg is not None
         self.extra_pos_embed_cfg = extra_pos_embed_cfg
         self.encoding_cfg = encoding_cfg
@@ -80,7 +82,7 @@ class LoTDNeRF(nn.Module):
 
         #------- Sigma decoder
         self.sigma_decoder_cfg.setdefault('use_tcnn_backend', self.use_tcnn_backend)
-        if self.if_extrafeat_from_output:
+        if self.is_extrafeat_from_output:
             self.n_rgb_used_extrafeat = self.n_rgb_used_output
             self.sigma_decoder, self.sigma_decoder_type = get_lotd_decoder(
                 self.encoding.lod_meta, (1 + self.n_rgb_used_output), n_extra_embed_ch=self.n_extra_embed, 
@@ -114,6 +116,7 @@ class LoTDNeRF(nn.Module):
     def preprocess_per_train_step(self, cur_it: int, logger: Logger = None):
         self.encoding.set_anneal_iter(cur_it)
 
+    @profile
     def forward(
         self, x: torch.Tensor, v: torch.Tensor = None, *, input_normalized=True, 
         h_appear_embed: torch.Tensor = None):
@@ -127,12 +130,13 @@ class LoTDNeRF(nn.Module):
         else:
             output = self.sigma_decoder(h)
         sigma = output[..., 0]
-        if self.if_extrafeat_from_output:
+        if self.is_extrafeat_from_output:
             rgb = self.rgb_decoder(x, v, None, h_extra=output[..., 1:], h_appear_embed=h_appear_embed)['radiances']
         else:
             rgb = self.rgb_decoder(x, v, None, h_extra=h, h_appear_embed=h_appear_embed)['radiances']
         return dict(sigma=sigma, radiances=rgb)
 
+    @profile
     def forward_sigma(self, x: torch.Tensor, input_normalized=True):
         if not input_normalized:
             x = self.space.normalize_coords(x)
@@ -156,10 +160,11 @@ class LoTDNeRF(nn.Module):
     def rescale_volume(self, new_aabb: torch.Tensor):
         return self.encoding.rescale_volume(new_aabb)
 
-class LoTDNeRFFramework(nerf_renderer_mixin, LoTDNeRF):
-    def __init__(self, *args, mixin_cfg=ConfigDict(), **kwargs) -> None:
-        LoTDNeRF.__init__(self, *args, **kwargs)
-        nerf_renderer_mixin.__init__(self, **mixin_cfg) 
+class LoTDNeRFModel(NeRFRendererMixin, LoTDNeRF):
+    """
+    MRO: NeRFRendererMixin -> LoTDNeRF -> ModelMixin -> nn.Module
+    """
+    pass
 
 if __name__ == "__main__":
     def unit_test(device=torch.device('cuda'), batch_size=365365):

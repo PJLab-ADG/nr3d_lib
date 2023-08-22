@@ -5,17 +5,18 @@
 """
 
 __all__ = [
-    'NeRFDistantFramework'
+    'NeRFDistantModel'
 ]
 
 from nr3d_lib.config import ConfigDict
 from nr3d_lib.models.fields.nerf import EmbededNeRF
-from nr3d_lib.models.fields_distant.nerf.renderer_mixin import nerf_distant_renderer_mixin
+from nr3d_lib.models.fields_distant.nerf.renderer_mixin import NeRFDistantRendererMixin
 
-class NeRFDistantFramework(nerf_distant_renderer_mixin, EmbededNeRF):
-    def __init__(self, *args, mixin_cfg=ConfigDict(), **kwargs) -> None:
-        EmbededNeRF.__init__(self, *args, **kwargs)
-        nerf_distant_renderer_mixin.__init__(self, **mixin_cfg) 
+class NeRFDistantModel(NeRFDistantRendererMixin, EmbededNeRF):
+    """
+    MRO: NeRFDistantRendererMixin -> EmbededNeRF -> ModelMixin -> nn.Module
+    """
+    pass
 
     # def ray_test(self, *args, **kwargs):
     #     if self.cr_obj is not None:

@@ -1,5 +1,5 @@
 """
-@file   normalize_camera.py
+@file   normalize_views.py
 @author Jianfei Guo, Shanghai AI Lab
 @brief  Helper functions for normalizing multiple views
 """

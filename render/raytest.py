@@ -88,20 +88,23 @@ def get_dvals_from_radius(
 def ray_box_intersection(
     rays_o: torch.Tensor, rays_d: torch.Tensor, *,
     aabb_min: Union[torch.Tensor,float]=-0.5, aabb_max: Union[torch.Tensor,float]=0.5, 
-    t_min_cons=None, t_max_cons=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-
-    If box frames are scaled to vertices between [-0.5, -0.5, -0.5] and [0.5, 0.5, 0.5] aabbb is not necessary
+    t_min_cons: float=None, t_max_cons: float=None) -> Tuple[torch.Tensor, torch.Tensor, torch.BoolTensor]:
+    """ Caculate intersections between rays and boxes
+        By default, assume box frames are scaled to vertices between [-0.5, -0.5, -0.5] and [0.5, 0.5, 0.5]
 
     Args:
-        ray_o: [..., 3],    Origin of the ray in each box frame
-        ray_d: [..., 3],    Unit direction of each ray in each box frame
-        (aabb_min): Vertex of a 3D bounding box, [-0.5, -0.5, -0.5] if not specified
-        (aabb_max): Vertex of a 3D bounding box, [0.5, 0.5, 0.5] if not specified
+        rays_o (torch.Tensor): [..., 3],    Origin of the ray in each box frame
+        rays_d (torch.Tensor): [..., 3],    Direction vector of each ray in each box frame
+        aabb_min (Union[torch.Tensor,float], optional): Vertex of a 3D bounding box. Defaults to -0.5.
+        aabb_max (Union[torch.Tensor,float], optional): Vertex of a 3D bounding box. Defaults to 0.5.
+        t_min_cons (float, optional): [...]. Optional minimum depth constraint. Defaults to None.
+        t_max_cons (float, optional): [...]. Optional maximum depth constraint. Defaults to None.
+
     Returns:
-        t_near:         [...]
-        t_far:          [...]
-        mask_intersect: [...], whether intersection happens
+        Tuple[torch.Tensor, torch.Tensor, torch.BoolTensor]:
+            t_near:         [...], Entry depth of intersection.
+            t_far:          [...], Exit depth of intersection.
+            mask_intersect: [...], T/F intersection marks
     """
     # Source: https://medium.com/@bromanz/another-view-on-the-classic-ray-aabb-intersection-algorithm-for-bvh-traversal-41125138b525
     # https://gamedev.stackexchange.com/questions/18436/most-efficient-aabb-vs-ray-collision-algorithms

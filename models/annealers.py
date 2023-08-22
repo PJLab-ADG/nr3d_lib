@@ -31,7 +31,7 @@ def get_anneal_val_logspace(it: int, *, stop_it: int, start_it: int = 0, start_v
     return np.exp(logv0 * (1-alpha) + logv1 * alpha)
 
 def get_anneal_val_milestones(it: int, milestones: List[int], vals: List[Any]) -> float:
-    assert len(milestones) == len(vals), 'milestones and vals should have the same length'
+    assert (len(milestones)+1) == len(vals), '`vals` should have one more element than `milestones`'
     # NOTE: a[i-1] <= v < a[i]
     i = np.searchsorted(milestones, it, side='right')
     v = vals[i]
@@ -118,8 +118,16 @@ class AnnealerConstant(AnnealerBase):
 
 class AnnealerMilestones(AnnealerBase):
     def __init__(self, milestones: List[int], vals: List[Any]) -> None:
+        """
+        e.g.
+        milestones: [100, 300]
+        vals: [0.1, 1.0, 10.0]
+        >>> val=0.1,  if it < 100
+        >>> val=1.0,  if 100 <= it < 300
+        >>> val=10.0, if it >= 300
+        """
         super().__init__()
-        assert len(milestones) == len(vals), 'milestones and vals should have the same length'
+        assert (len(milestones)+1) == len(vals), '`vals` should have one more element than `milestones`'
         self.milestones = milestones
         self.vals = vals
     def __call__(self, it: int):
@@ -192,6 +200,15 @@ class AnnealerLambda():
 if __name__ == "__main__":
     def unit_test():
         import matplotlib.pyplot as plt
+        
+        an = AnnealerMilestones([100,300,600], [0.1, 0.2, 0.3, 0.4])
+        vs = []
+        its = list(range(1000))
+        for it in its:
+            v = an(it)
+            vs.append(v)
+        plt.plot(its, vs)
+        plt.show()
         
         common = dict(
             start_val = 10., 

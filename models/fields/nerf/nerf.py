@@ -8,7 +8,7 @@ __all__ = [
     'NeRF', 
     'EmbededNeRF', 
     'RadianceNet', 
-    'NeRFFramework'
+    'NeRFModel'
 ]
 
 import math
@@ -20,16 +20,19 @@ import torch.nn as nn
 from torch import autograd
 import torch.nn.functional as F
 
+from nr3d_lib.profile import profile
 from nr3d_lib.utils import torch_dtype
 from nr3d_lib.config import ConfigDict
+
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.blocks import get_blocks
 from nr3d_lib.models.embedders import get_embedder
 from nr3d_lib.models.layers import DenseLayer, get_nonlinearity
 from nr3d_lib.models.spatial import AABBSpace
-from nr3d_lib.models.fields.nerf.renderer_mixin import nerf_renderer_mixin
+from nr3d_lib.models.fields.nerf.renderer_mixin import NeRFRendererMixin
 
 # Modified from https://github.com/yenchenlin/nerf-pytorch
-class NeRF(nn.Module):
+class NeRF(ModelMixin, nn.Module):
     def __init__(
         self, 
         input_ch_pts=3, input_ch_view=3, use_view_dirs=True, 
@@ -79,7 +82,7 @@ class NeRF(nn.Module):
             sigma = self.sigma_activation(outputs[..., 3:])
         return dict(sigma=sigma[..., 0])
 
-class EmbededNeRF(nn.Module):
+class EmbededNeRF(ModelMixin, nn.Module):
     def __init__(
         self,
         input_ch_pts=3, input_ch_view=3, 
@@ -154,7 +157,7 @@ class EmbededNeRF(nn.Module):
             input_pts = torch.cat([input_pts, self.embed_fn_h_geo(h_geo_embed)], dim=-1)
         return self.nerf_base.forward_sigma(input_pts)
 
-class RadianceNet(nn.Module):
+class RadianceNet(ModelMixin, nn.Module):
     def __init__(
         self,
         use_pos=True, pos_dim=3, pos_embed_cfg:dict={'type':'identity'}, 
@@ -218,6 +221,7 @@ class RadianceNet(nn.Module):
     def get_weight_reg(self, norm_type: float = 2.0):
         return self.blocks.get_weight_reg(norm_type)
     
+    @profile
     def forward(
         self, x: torch.Tensor, v: torch.Tensor=None, n: torch.Tensor=None, *, h_extra: torch.Tensor=None, h_appear_embed: torch.Tensor=None):
         # Calculate radiance field
@@ -236,10 +240,11 @@ class RadianceNet(nn.Module):
         radiances = self.blocks(radiance_input)
         return dict(radiances=radiances)
 
-class NeRFFramework(nerf_renderer_mixin, EmbededNeRF):
-    def __init__(self, *args, mixin_cfg=ConfigDict(), **kwargs) -> None:
-        EmbededNeRF.__init__(self, *args, **kwargs)
-        nerf_renderer_mixin.__init__(self, **mixin_cfg) 
+class NeRFModel(NeRFRendererMixin, EmbededNeRF):
+    """
+    MRO: NeRFRendererMixin -> EmbededNeRF -> ModelMixin -> nn.Module
+    """
+    pass
 
 if __name__ == "__main__":
     def unit_test(device=torch.device('cuda'), batch_size=365365):

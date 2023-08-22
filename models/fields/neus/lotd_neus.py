@@ -6,11 +6,13 @@
 
 __all__ = [
     'LoTDNeuS', 
-    'LoTDNeuSFramework'
+    'LoTDNeuSModel'
 ]
 
 import numpy as np
-from typing import Dict
+from copy import deepcopy
+from numbers import Number
+from typing import Dict, List, Union
 
 import torch
 import torch.nn as nn
@@ -19,19 +21,21 @@ import torch.nn.functional as F
 from nr3d_lib.fmt import log
 from nr3d_lib.logger import Logger
 from nr3d_lib.config import ConfigDict
+from nr3d_lib.profile import profile
 from nr3d_lib.utils import tensor_statistics, torch_dtype
 
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.annealers import get_annealer
 from nr3d_lib.models.fields.sdf import LoTDSDF
 from nr3d_lib.models.fields.nerf import RadianceNet
 from nr3d_lib.models.fields.neus.variance import get_neus_var_ctrl
-from nr3d_lib.models.fields.neus.renderer_mixin import neus_renderer_mixin
+from nr3d_lib.models.fields.neus.renderer_mixin import NeusRendererMixin
 
-class LoTDNeuS(nn.Module):
+class LoTDNeuS(ModelMixin, nn.Module):
     def __init__(
         self,
-        var_ctrl_cfg: ConfigDict = ConfigDict(ln_inv_s_init=0.3, ln_inv_s_factor=10.0), 
-        surface_cfg: ConfigDict = ConfigDict(),
+        surface_cfg: ConfigDict,
+        var_ctrl_cfg: ConfigDict=ConfigDict(ln_inv_s_init=0.3, ln_inv_s_factor=10.0), 
         radiance_cfg: ConfigDict = None,
         cos_anneal_cfg: ConfigDict = None,
         dtype=torch.float, device=torch.device("cuda"), use_tcnn_backend=False
@@ -102,27 +106,25 @@ class LoTDNeuS(nn.Module):
         return self.implicit_surface.space
 
     def preprocess_model(self):
-        if hasattr(self.implicit_surface, 'preprocess_model'):
-            self.implicit_surface.preprocess_model()
+        self.implicit_surface.preprocess_model()
 
     def preprocess_per_train_step(self, cur_it: int, logger: Logger = None):
         self.ctrl_var.set_iter(cur_it)
         if self.ctrl_cos_anneal is not None:
             self.ctrl_cos_anneal.set_iter(cur_it)
-        if hasattr(self.implicit_surface, 'preprocess_per_train_step'):
-            self.implicit_surface.preprocess_per_train_step(cur_it, logger=logger)
+        self.implicit_surface.preprocess_per_train_step(cur_it, logger=logger)
 
     def forward_inv_s(self):
         return self.ctrl_var()
 
-    # @profile
+    @profile
     def forward_sdf(self, x: torch.Tensor, *, return_h=False, input_normalized=True):
         return self.implicit_surface(x, return_h=return_h, max_level=self.max_level, input_normalized=input_normalized)
     
     def query_sdf(self, x: torch.Tensor, input_normalized=True) -> torch.Tensor:
         return self.forward_sdf(x, input_normalized=input_normalized)['sdf']
     
-    # @profile
+    @profile
     def forward_sdf_nablas(
         self,  x: torch.Tensor, *, input_normalized=True, 
         has_grad: bool=None, nablas_has_grad: bool=None, grad_guard=None):
@@ -131,6 +133,7 @@ class LoTDNeuS(nn.Module):
             has_grad=has_grad, nablas_has_grad=nablas_has_grad, 
             max_level=self.max_level, grad_guard=grad_guard)
     
+    @profile
     def forward(
         self, x: torch.Tensor, v: torch.Tensor, *, h_appear_embed: torch.Tensor = None, 
         input_normalized=True, has_grad:bool=None, nablas_has_grad: bool=None, 
@@ -223,35 +226,133 @@ class LoTDNeuS(nn.Module):
         return self.radiance_net.blocks.lipshitz_bound_full(*args, **kwargs)
 
     @torch.no_grad()
-    def stat_param(self, with_grad=False, prefix='') -> Dict[str, float]:
+    def stat_param(self, with_grad=False, prefix: str='') -> Dict[str, float]:
+        prefix_ = prefix + ('.' if prefix and not prefix.endswith('.') else '')
         ret = {}
-        ret.update(self.implicit_surface.stat_param(with_grad=with_grad, prefix=prefix+''))
-        ret.update({prefix + f'radiance_net.total.{k}': v for k, v in tensor_statistics(torch.cat([p.data.flatten() for p in self.radiance_net.parameters()])).items()})
-        ret.update({prefix + f"radiance_net.{n}.{k}": v for n, p in self.radiance_net.named_parameters() for k, v in tensor_statistics(p.data).items()})
+        ret.update(self.implicit_surface.stat_param(with_grad=with_grad, prefix=prefix_ + 'surface.'))
+        ret.update({prefix_ + f'radiance_net.total.{k}': v for k, v in tensor_statistics(torch.cat([p.data.flatten() for p in self.radiance_net.parameters()])).items()})
+        ret.update({prefix_ + f"radiance_net.{n}.{k}": v for n, p in self.radiance_net.named_parameters() for k, v in tensor_statistics(p.data).items()})
         if with_grad:
-            ret.update({prefix + f'radiance_net.grad.total.{k}': v for k, v in tensor_statistics(torch.cat([p.grad.data.flatten() for p in self.radiance_net.parameters() if p.grad is not None])).items()})
-            ret.update({prefix + f"radiance_net.grad.{n}.{k}": v for n, p in self.radiance_net.named_parameters() if p.grad is not None for k, v in tensor_statistics(p.grad.data).items()})
+            ret.update({prefix_ + f'radiance_net.grad.total.{k}': v for k, v in tensor_statistics(torch.cat([p.grad.data.flatten() for p in self.radiance_net.parameters() if p.grad is not None])).items()})
+            ret.update({prefix_ + f"radiance_net.grad.{n}.{k}": v for n, p in self.radiance_net.named_parameters() if p.grad is not None for k, v in tensor_statistics(p.grad.data).items()})
         return ret
 
     @torch.no_grad()
     def custom_grad_clip_step(self):
         self.implicit_surface.custom_grad_clip_step()
 
-# Rules of mixins:
-# - Mixin class name should come before model class name. 
-#   - So that a mixin's methods can override model's methods.
-#   - So that when overriding, mixin's methods could call super().xxx() to call model's methods
-# - Mixin's should init after model, because model's __init__ calls nn.Module.__init__
-# - Outside users will not need to care about the content of mixins (directly use already mixin-ed classes)
-# - If necessary, renderering or mixin methods can be directly implemented in own model class, instead of multiple inheritance (e.g. analytic tracing etc.)
+    def get_param_group(self, optim_cfg: Union[Number,dict], prefix: str = '') -> List[dict]:
+        prefix_ = prefix + ('.' if prefix and not prefix.endswith('.') else '')
+        
+        # NOTE: This function is just for seperately specifying `betas` for learnable inv_s ctrl
+        #       Stable SDF (eikonal) training prefers betas=(0.9,0.99), \
+        #           but the original inv_s self-adaptiveness works better with betas=(0.9,0.999)
+        
+        if (self.ctrl_var is None) \
+            or (len(list(self.ctrl_var.parameters())) == 0) \
+            or (optim_cfg.get('invs_betas', None) is None):
+            return super().get_param_group(optim_cfg, prefix)
+        else:
+            optim_cfg = deepcopy(optim_cfg)
+            invs_betas = optim_cfg.pop('invs_betas', [0.9,0.999])
+            invs_optim_cfg = deepcopy(optim_cfg)
+            invs_optim_cfg['betas'] = invs_betas
+            
+            pg_invs = {
+                'name': prefix_ + "invs_group", 
+                'params': [], 
+                **invs_optim_cfg
+            }
+            
+            pg_others = {
+                'name': prefix_ + "network_group", 
+                'params': [], 
+                **optim_cfg
+            }
+            
+            for n, p in self.named_parameters():
+                if 'ctrl_var' in n:
+                    pg_invs['params'].append(p)
+                else:
+                    pg_others['params'].append(p)
+            
+            all_pg = [pg_invs, pg_others]
+            return all_pg
 
-class LoTDNeuSFramework(neus_renderer_mixin, LoTDNeuS):
-    def __init__(self, *args, mixin_cfg=ConfigDict(), **kwargs) -> None:
-        LoTDNeuS.__init__(self, *args, **kwargs)
-        neus_renderer_mixin.__init__(self, **mixin_cfg) 
+class LoTDNeuSModel(NeusRendererMixin, LoTDNeuS):
+    """
+    MRO: LoTDNeuSModel -> NeusRendererMixin -> LoTDNeuS -> ModelMixin -> nn.Module
+    """
+    pass
 
 if __name__ == "__main__":
     def unit_test(device=torch.device('cuda')):
-        pass
+        # class TestNet(nn.Module): # NOTE: Not inheriting ModelMixin --- troublesome
+        #     def __init__(self) -> None:
+        #         super().__init__()
+        #         self.encoder = nn.ModuleDict()
+        #         self.decoder = nn.ModuleDict()
+        #     def populate(self):
+        #         print("I have useful populate process !")
+        # class TestModel1(NeusRendererMixin, TestNet):
+        #     """
+        #     MRO: TestModel1 -> NeusRendererMixin -> ModelMixin -> TestNet -> nn.Module
+        #     NOTE: This is wrong ! TestNet should inherit from ModelMixin !
+        #           This will cause the default empty ModelMixin.populate() overwrites the meaningful TestNet.populate()!
+        #     """
+        #     def __init__(self) -> None:
+        #         super().__init__()
+        # class TestModel2(LoTDNeuS, NeusRendererMixin):
+        #     """
+        #     MRO: TestModel2 -> LoTDNeuS -> NeusRendererMixin -> ModelMixin -> nn.Module
+        #     NOTE: This is wrong ! NeusRendererMixin should comes before LoTDNeuS !
+        #           This will cause mixin'__init__(),  populate(), etc. never being used (being overwritten by LoTDNeuS).
+        #     """
+        #     def __init__(self) -> None:
+        #         super().__init__()
+        # m1 = TestModel1()
+        # m1.populate()
+        # m2 = TestModel2()
+        # m2.populate()
         
+        cfg = ConfigDict(
+            dtype='half', 
+            var_ctrl_cfg=ConfigDict(ctrl_type='learned', ln_inv_s_init=0.1, ln_inv_s_factor=10.0), 
+            surface_cfg=ConfigDict(
+                bounding_size=2., 
+                encoding_cfg=ConfigDict(
+                    lotd_auto_compute_cfg=ConfigDict(
+                        type='ngp', target_num_params=12*2**20, min_res=16, 
+                    ), 
+                ), 
+                decoder_cfg=ConfigDict(type='mlp', D=1, W=64), 
+                n_rgb_used_output=0, 
+                geo_init_method='pretrain_after_zero_out'
+            ), 
+            radiance_cfg=ConfigDict(
+                use_pos=True, use_nablas=True, use_view_dirs=True, dir_embed_cfg=ConfigDict(
+                    type='spherical', degree=4, 
+                ), D=2, W=64
+            ), 
+            mixin_cfg=ConfigDict(
+                accel_cfg=ConfigDict(
+                    type='occ_grid', 
+                    occ_cfg=ConfigDict(
+                        resolution=[64, 64, 64], 
+                        occ_val_fn_cfg=ConfigDict(
+                            type='sdf', 
+                            inv_s=256.0
+                        )
+                    )
+                )
+            )
+        )
+        m = LoTDNeuSModel(**cfg)
+        m.populate()
+        print(m)
+        x = torch.randn([4096, 3], dtype=torch.float, device=device)
+        v = torch.randn([4096, 3], dtype=torch.float, device=device)
+        out = m.forward(x, v)
+        print(out['sdf'].shape, out['radiances'].shape)
+                
     unit_test()

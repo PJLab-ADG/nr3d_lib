@@ -242,10 +242,13 @@ def get_path_front_left_lift_then_spiral_forward(
     num_frames: int, # Number of frames / waypoints to generate
     duration_frames: int = 48, # Number of frames per round / cycle
     # Spiral configs
-    up_max: float = 2.5, up_offset: float = 1.0, left_max: float = 2.5, left_offset: float = -1.2, elongation: float = 1., 
-    front_vec: np.ndarray = np.array([1., 0., 0.]),  # Frontal direction vector
-    up_vec: np.ndarray = np.array([0., 0., 1.]),  # Frontal direction vector
-    left_vec: np.ndarray = np.array([0., 1., 0.]),  # Frontal direction vector
+    up_max: float = 1.8, up_min: float = 0.2, 
+    left_max: float = 1.0, left_min: float = 0., 
+    elongation: float = 1., first_with_forward=False, 
+    forward_vec: np.ndarray = np.array([0., 0., 1.]),  # Frontal direction vector of OpenCV
+    up_vec: np.ndarray = np.array([0., -1., 0.]),  # Frontal direction vector of OpenCV
+    left_vec: np.ndarray = np.array([-1., 0., 0.]),  # Frontal direction vector of OpenCV
+    verbose=False, **verbose_kwargs
     ) -> np.ndarray:
     """
     First lift ego in the front left direction, then do spiral forward
@@ -254,51 +257,61 @@ def get_path_front_left_lift_then_spiral_forward(
     n_rots = num_frames / duration_frames
     track_ref = pose_ref.translation()
     rot_ref = pose_ref.rotation()
-    front_vecs = pose_ref.forward(check_to_torch(front_vec, ref=pose_ref)) - track_ref
-    up_vecs = pose_ref.forward(check_to_torch(up_vec, ref=pose_ref)) - track_ref
-    left_vecs = pose_ref.forward(check_to_torch(left_vec, ref=pose_ref)) - track_ref
+    # NOTE: Convert from observer's coords dir to world coords dir;
+    #       If the pose_ref is the pose of camera, `forward/up/left_vec` can be used as-is;
+    #           (since the cameras are already OpenCV cameras if dataio's xxx_dataset.py is correctly implemented)
+    #       otherwise, you should specify the coords dir vector of your given pose_ref.
+    forward_vecs_ref = pose_ref.forward(check_to_torch(forward_vec, ref=pose_ref)) - track_ref
+    up_vecs_ref = pose_ref.forward(check_to_torch(up_vec, ref=pose_ref)) - track_ref
+    left_vecs_ref = pose_ref.forward(check_to_torch(left_vec, ref=pose_ref)) - track_ref
     
-    front_vecs = front_vecs.numpy()
-    up_vecs = up_vecs.numpy()
-    left_vecs = left_vecs.numpy()
+    forward_vecs_ref = forward_vecs_ref.numpy()
+    up_vecs_ref = up_vecs_ref.numpy()
+    left_vecs_ref = left_vecs_ref.numpy()
     track_ref = track_ref.numpy()
     rot_ref = rot_ref.numpy()
     
     nvs_seqs = []
     
+    verti_radius = (up_max - up_min) / 2.
+    up_offset = (up_max + up_min) / 2.
+    horiz_radius = (left_max - left_min) / 2.
+    left_offset = (left_max + left_min) / 2.
+    assert (verti_radius >= -1e-5) and (horiz_radius >= -1e-5)
+    
     #----------------------------------------
-    #---- 1st round: lift up 2.0 unit
+    #---- First: lift up & left
     #----------------------------------------
     first_frames = int(0.25 * duration_frames)+1
     remain_frames = num_frames - first_frames
     pace = np.linalg.norm(track_ref[0] - track_ref[-1]) * elongation
-    forward_1st = (first_frames / num_frames) * pace
+    forward_1st = ((first_frames / num_frames) * pace) if first_with_forward else 0
     
     track = track_ref[0] \
-        + np.linspace(0, up_max/2.+up_offset, first_frames)[..., None] * up_vecs[0] \
-        + np.linspace(0, left_max+left_offset, first_frames)[..., None] * left_vecs[0] \
-        + np.linspace(0, forward_1st, first_frames)[..., None] * front_vecs[0]
+        + np.linspace(0, verti_radius+up_offset, first_frames)[..., None] * up_vecs_ref[0] \
+        + np.linspace(0, horiz_radius+left_offset, first_frames)[..., None] * left_vecs_ref[0] \
+        + np.linspace(0, forward_1st, first_frames)[..., None] * forward_vecs_ref[0]
     pose = np.eye(4)[None,...].repeat(first_frames, 0)
     pose[:, :3, 3] = track
     pose[:, :3, :3] = rot_ref[0]
     nvs_seqs.append(pose)
     
     #----------------------------------------
-    #----       Sprial forward
+    #---- Then:   Sprial forward
     #----------------------------------------
-    # [0->1]
     w = np.linspace(0,1,remain_frames) # [0->1], data key time
     t = np.arange(len(track_ref)) / (len(track_ref)-1) # [0->1], render key time (could be extended)
     track_interp = interpolate.interp1d(t, track_ref, axis=0, fill_value='extrapolate')
-    up_vec_interp = interpolate.interp1d(t, up_vecs, axis=0, fill_value='extrapolate')
-    left_vec_interp = interpolate.interp1d(t, left_vecs, axis=0, fill_value='extrapolate')
+    up_vec_interp = interpolate.interp1d(t, up_vecs_ref, axis=0, fill_value='extrapolate')
+    left_vec_interp = interpolate.interp1d(t, left_vecs_ref, axis=0, fill_value='extrapolate')
     
     up_vecs_all = up_vec_interp(w * elongation)
     left_vecs_all = left_vec_interp(w * elongation)
-    track_base_all = track_interp(w * elongation) + (up_max/2.+up_offset) * up_vecs_all + (left_max+left_offset) * left_vecs_all + forward_1st * front_vecs[None, 0]
+    #---- Base: left * [1], up * [1]
+    track_base_all = track_interp(w * elongation) + (up_offset+verti_radius) * up_vecs_all + (left_offset+horiz_radius) * left_vecs_all + forward_1st * forward_vecs_ref[None, 0]
     
-    # up_vecs_all = np.percentile(up_vecs, w*100, 0)
-    # left_vecs_all = np.percentile(left_vecs, w*100, 0)
+    # up_vecs_all = np.percentile(up_vecs_ref, w*100, 0)
+    # left_vecs_all = np.percentile(left_vecs_ref, w*100, 0)
     # track_base_all = np.percentile(track_ref, w*100, 0) + (up_max+up_offset) * up_vecs_all + (left_max+left_offset) * left_vecs_all
     
     key_rots = R.from_matrix(rot_ref)
@@ -312,17 +325,28 @@ def get_path_front_left_lift_then_spiral_forward(
         rot_base_all = rot_slerp(w).as_matrix()
     
     rads = np.linspace(0, remain_frames / duration_frames * np.pi * 2., remain_frames)
-    # left: 0, -1, -2, -1, 0
-    # up: 0, 1, 0, -1, 0
+    #---- Spiral: 
+    # left: [0, -1, -2, -1, 0] + base: [1] -> [1, 0, -1, 0, 1]
+    # up: [0, 1, 0, -1, 0] + base [1] -> [1, 2, 1, 0, 1]
     track = track_base_all \
-        + (np.cos(rads)-1)[..., None] * left_max/2. * left_vecs_all\
-        + (np.sin(rads))[..., None] * up_max/2. * up_vecs_all
+        + (np.cos(rads)-1)[..., None] * horiz_radius * left_vecs_all\
+        + (np.sin(rads))[..., None] * verti_radius * up_vecs_all
     pose = np.eye(4)[None,...].repeat(remain_frames, 0)
     pose[:, :3, 3] = track
     pose[:, :3, :3] = rot_base_all
     nvs_seqs.append(pose)
     
     render_pose_all = np.concatenate(nvs_seqs, 0)
+    
+    def debug_vis():
+        import vedo
+        track0 = vedo.Line(track_ref).color("blue")
+        track = vedo.Line(render_pose_all[:, :3, 3]).color("red")
+        vedo.show(track0, track, axes=1, new=True)
+    
+    if verbose:
+        debug_vis(**verbose_kwargs)
+    
     return render_pose_all
 
 def get_path_interpolation(

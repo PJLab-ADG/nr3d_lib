@@ -8,8 +8,8 @@ __all__ = [
     'OccupancyGridAS'
 ]
 
-from typing import Dict
 from numbers import Number
+from typing import Dict, List, Union
 
 import torch
 import torch.nn as nn
@@ -35,17 +35,28 @@ DEBUG_OCCGRID_INTERACTIVE = False # [True] = Allow mouse dragging on the vedo wi
 
 class OccupancyGridAS(nn.Module):
     def __init__(
-        self, space: AABBSpace, occ_cfg: ConfigDict, 
-        dtype=torch.float, device=torch.device('cuda')) -> None:
+        self, 
+        space: AABBSpace, 
+        dtype=torch.float, 
+        device=torch.device('cuda'), 
+        resolution: Union[int, List[int], torch.Tensor] = None, 
+        vox_size: float = None, 
+        **occ_kwargs) -> None:
         super().__init__()
         
         #------- Valid representing space 
         assert isinstance(space, AABBSpace), f"{self.__class__.__name__} expects space of AABBSpace"
         self.space: AABBSpace = space
         self.dtype = dtype
+        # self.device = device # NOTE: Directly use the device of self.space
         
         #------- Occupancy information
-        self.occ = OccupancyGridEMA(**occ_cfg, dtype=self.dtype, device=self.device)
+        assert bool(resolution is not None) != bool(vox_size is not None), \
+            "Please specify `vox_size` or `resolution` for OccupancyGridAS."
+        
+        if resolution is None:
+            resolution = (self.space.stretch / vox_size).long()
+        self.occ = OccupancyGridEMA(**occ_kwargs, resolution=resolution, dtype=self.dtype, device=self.device)
         
         self.training_granularity = 0.0 # No level/resolution annealing
 

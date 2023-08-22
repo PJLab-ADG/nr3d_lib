@@ -18,12 +18,13 @@ from torch import autograd
 from nr3d_lib.utils import torch_dtype
 from nr3d_lib.config import ConfigDict
 
+from nr3d_lib.models.base import ModelMixin
 from nr3d_lib.models.spatial import AABBSpace
 from nr3d_lib.models.embedders import get_embedder
 from nr3d_lib.models.layers import DenseLayer, get_nonlinearity
 from nr3d_lib.models.fields.sdf.utils import pretrain_sdf_sphere
 
-class MlpPESDF(nn.Module):
+class MlpPESDF(ModelMixin, nn.Module):
     def __init__(
         self, 
         D=8, W=256, Ws=None, skips=[4], input_ch=3, n_rgb_used_output=0, n_frequencies=6, 
@@ -32,7 +33,8 @@ class MlpPESDF(nn.Module):
         geo_init_method: Literal['geometric', 'pretrain', 'pretrain_after_geometric']='geometric',
         bounding_size=2.0, # Network's boundary size; coordinates are within [-bounding_size/2, bounding_size/2]
         aabb=None, # Network's boundary; coordinates are within [aabb[0], aabb[1]]
-        weight_norm=False, use_tcnn_backend=False, dtype=torch.float, device=torch.device('cuda')):
+        weight_norm=False, use_tcnn_backend=False, dtype=torch.float, device=torch.device('cuda'), 
+        ):
         """
         n_rgb_used_output: 
             1. sdf decoder output width = 1 + n_rgb_used_output
@@ -55,7 +57,7 @@ class MlpPESDF(nn.Module):
         self.radius_init = radius_init
         self.inside_out = inside_out
         self.geo_init_method = geo_init_method
-        self.if_extrafeat_from_output = n_rgb_used_output > 0
+        self.is_extrafeat_from_output = n_rgb_used_output > 0
         if n_frequencies > 0:
             # NOTE: For now, the CUDA sinusoidal does not support 2nd backward ! Use sinusoidal_legacy instead.
             self.embed_fn, input_ch = get_embedder({'type': 'sinusoidal_legacy', 'n_frequencies': n_frequencies}, 3)
@@ -65,7 +67,7 @@ class MlpPESDF(nn.Module):
 
         self.D = D
         self.skips = skips
-        self.n_rgb_used_extrafeat = n_rgb_used_output if self.if_extrafeat_from_output else Ws[-1]
+        self.n_rgb_used_extrafeat = n_rgb_used_output if self.is_extrafeat_from_output else Ws[-1]
 
         surface_fc_layers = []
         # NOTE: as in IDR/NeuS, the network's has D+1 layers
@@ -130,7 +132,7 @@ class MlpPESDF(nn.Module):
         geo_init_method = self.geo_init_method
         if self.geo_init_method == 'pretrain' or ('pretrain_after' in geo_init_method):
             if not self.is_pretrained:
-                pretrain_sdf_sphere(self, target_radius=self.radius_init, aabb=self.space.aabb, logger=logger, log_prefix=log_prefix, **config)
+                pretrain_sdf_sphere(self, target_radius=self.radius_init, logger=logger, log_prefix=log_prefix, **config)
                 self.is_pretrained = ~self.is_pretrained
                 return True
         return False
@@ -150,7 +152,7 @@ class MlpPESDF(nn.Module):
         
         out = self.surface_fc_layers[-1](h)
         
-        if self.if_extrafeat_from_output > 0:
+        if self.is_extrafeat_from_output > 0:
             if return_h:
                 ret['h'] = out[..., 1:]
             ret['sdf'] = out[..., 0]

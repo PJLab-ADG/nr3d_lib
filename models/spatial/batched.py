@@ -66,7 +66,7 @@ class BatchedBlockSpace(nn.Module):
 
     def ray_test(
         self, rays_o: torch.Tensor, rays_d: torch.Tensor, near=None, far=None, 
-        return_rays=True, normalized=False, compact_batch=False, **extra_ray_shaped):
+        return_rays=True, normalized=False, compact_batch=False, **extra_ray_data):
         assert rays_o.dim() == rays_d.dim() == 3 # [B, N_rays, 3]
         if not normalized: rays_o, rays_d = self.normalize_rays(rays_o, rays_d)
         """
@@ -114,6 +114,7 @@ class BatchedBlockSpace(nn.Module):
                 )
             inds = (full_bidx,ridx)
             ret.update(near=near_[inds], far=far_[inds])
+            ret.update({k: v[inds] if isinstance(v, torch.Tensor) else v for k, v in extra_ray_data.items()})
         if return_rays:
             ret.update(rays_o=rays_o[inds], rays_d=rays_d[inds])
         return ret

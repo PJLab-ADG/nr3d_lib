@@ -1,5 +1,5 @@
 """
-@file   coordinates.py
+@file   conversion.py
 @author Jianfei Guo, Shanghai AI Lab
 @brief  Tutorials on conversion among coordinate systems
 """
