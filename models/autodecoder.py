@@ -23,7 +23,7 @@ class AutoDecoderMixin(ModelMixin):
     The resulting MRO:
         AD_xxxModel -> AutoDecoderMixin -> xxxModel -> xxxRendererMixin -> xxxNet -> ModelMixin -> nn.Module
     """
-    def __init__(self, key_list: List[str], latents: ConfigDict, **model_params):
+    def __init__(self, key_list: List[str], latents_cfg: ConfigDict = None, **model_params):
         
         mro = type(self).mro()
         super_class = mro[mro.index(AutoDecoderMixin)+1]
@@ -34,10 +34,11 @@ class AutoDecoderMixin(ModelMixin):
         
         super().__init__(**model_params)
 
-        self._latents_cfg = latents
+        self._latents_cfg = latents_cfg
         self._latents = nn.ModuleDict()
-        for latent_name, latent_cfg in latents.items():
-            self._latents[latent_name] = nn.Embedding(len(key_list), latent_cfg['dim'])
+        if self._latents_cfg is not None:
+            for lname, lcfg in self._latents_cfg.items():
+                self._latents[lname] = nn.Embedding(len(key_list), lcfg['dim'])
         
         self._keys = key_list
         self._keys_prob = [0.] * len(self._keys)
@@ -122,27 +123,12 @@ class AutoDecoderMixin(ModelMixin):
     #     return {lname: torch.randn([*prefix, lcfg['dim']], device=self.device, dtype=self.dtype) \
     #                 for lname, lcfg in self._latents_cfg.items()}
 
-def create_autodecoder(key_list: List[str], framework: ConfigDict, latents: ConfigDict = None):
-    model_cls = import_str(framework.model_class)
-    mixined_cls_name = "AD_" + model_cls.__name__
-    mixined_model_class = type(mixined_cls_name, (AutoDecoderMixin, model_cls), {'_model_cls': model_cls})
-    return mixined_model_class(key_list, latents, **framework.model_params)
-
-# NOTE: Temporary backward-compatibility.
-AutoDecoderModule = create_autodecoder
+# def create_autodecoder(key_list: List[str], framework: ConfigDict, latents: ConfigDict = None):
+#     model_cls = import_str(framework.model_class)
+#     mixined_cls_name = "AD_" + model_cls.__name__
+#     mixined_model_class = type(mixined_cls_name, (AutoDecoderMixin, model_cls), {'_model_cls': model_cls})
+#     return mixined_model_class(key_list, latents, **framework.model_params)
 
 if __name__ == "__main__":
-    def test():
-        from addict import Dict
-        from icecream import ic
-        dummy_cfg = Dict()
-        dummy_cfg.framework.target = 'models.categorical.PIGAN'
-        dummy_cfg.framework.param = {}
-        dummy_cfg.latents.shape.dim = 128
-        dummy_cfg.latents.appearance.dim = 128
-        # dummy_cfg.freeze()
-        model = create_autodecoder(['obj1', 'obj2', ], dummy_cfg).to('cuda:0')
-        model.set_condition({'keys':'obj2'})
-        ret = model.forward_sigma_rgb(x=torch.randn([7, 3]).cuda(), v=torch.randn([7,3]).cuda())
-        ic(ret)
-    test()
+    def unit_test():
+        pass
