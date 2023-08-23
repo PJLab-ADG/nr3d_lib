@@ -326,7 +326,7 @@ class NeusRendererMixin(ModelMixin):
         # NOTE: The device & dtype of output
         device, dtype = rays_o.device, rays_o.dtype
         # NOTE: The spatial length scale on each ray caused by scaling rays_d 
-        dir_scale = rays_d.norm(dim=-1)  # [num_rays]
+        dir_scale = rays_d.data.norm(dim=-1)  # [num_rays]
         # NOTE: The normalized ray direction vector in network's space
         view_dirs = rays_d / dir_scale.clamp_min_(1.0e-10).unsqueeze(-1) # [num_rays, 3]
         
@@ -496,7 +496,7 @@ class NeusRendererMixin(ModelMixin):
         device, dtype = rays_o.device, rays_o.dtype
         
         # NOTE: The spatial length scale on each ray caused by scaling rays_d 
-        dir_scale = rays_d.norm(dim=-1)  # [num_rays]
+        dir_scale = rays_d.data.norm(dim=-1)  # [num_rays]
         # NOTE: The normalized ray direction vector in network's space
         view_dirs = rays_d / dir_scale.clamp_min_(1.0e-10).unsqueeze(-1) # [num_rays, 3]
 
@@ -777,7 +777,7 @@ class NeusRendererMixin(ModelMixin):
         # NOTE: The device & dtype of output
         device, dtype = rays_o.device, rays_o.dtype
         # NOTE: The spatial length scale on each ray caused by scaling rays_d 
-        dir_scale = rays_d.norm(dim=-1)  # [num_rays]
+        dir_scale = rays_d.data.norm(dim=-1)  # [num_rays]
         # NOTE: The normalized ray direction vector in network's space
         view_dirs = rays_d / dir_scale.clamp_min_(1.0e-10).unsqueeze(-1) # [num_rays, 3]
 
