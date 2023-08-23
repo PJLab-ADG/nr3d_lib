@@ -186,23 +186,23 @@ def get_optimizer(model: nn.Module, **optim_cfg):
     return optimizer
 
 def CosineAnnealWarmUpSchedulerLambda(total_steps: int, warmup_steps: int = 0, min_factor: float=0.1):
-    assert 0 <= min_factor < 1
+    assert 0 < min_factor < 1
     def lambda_fn(epoch):
         """
         Modified from https://github.com/Totoro97/NeuS/blob/main/exp_runner.py
         """
         if epoch < warmup_steps:
-            learning_factor = epoch / warmup_steps
+            learning_factor = max(epoch / warmup_steps, 1e-3)
         else:
             learning_factor = (np.cos(np.pi * ((epoch - warmup_steps) / (total_steps - warmup_steps))) + 1.0) * 0.5 * (1-min_factor) + min_factor
         return learning_factor
     return lambda_fn
 
 def ExponentialSchedulerLambda(total_steps: int, warmup_steps: int = 0, min_factor: float=0.1):
-    assert 0 <= min_factor < 1
+    assert 0 < min_factor < 1
     def lambda_fn(epoch):
         if epoch < warmup_steps:
-            learning_factor = epoch / warmup_steps
+            learning_factor = max(epoch / warmup_steps, 1e-3)
         else:
             t = np.clip((epoch-warmup_steps) / (total_steps-warmup_steps), 0, 1)
             learning_factor = np.exp(t * np.log(min_factor))
