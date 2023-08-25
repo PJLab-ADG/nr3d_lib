@@ -225,8 +225,8 @@ class NeusRendererMixin(ModelMixin):
         with_rgb: bool = True, with_normal: bool = True, 
         perturb: bool = False, nablas_has_grad: bool = False,
         # Distinct params
-        distance_scale: float = 0.95, hit_threshold: float = 5e-4,
-        hit_at_neg: bool = False, max_steps_between_compact: int = 4,
+        distance_scale: float = 1., min_step: float = .1,
+        max_steps_between_compact: int = 4,
         max_march_iters: int = 1000, drop_alive_rate: float = 0., debug: bool = False
         ):
         """
@@ -240,20 +240,16 @@ class NeusRendererMixin(ModelMixin):
         from nr3d_lib.render.sphere_trace import SphereTracer, DenseGrid
         tracer = SphereTracer(DenseGrid(*self.accel.occ.resolution, self.accel.occ.occ_grid),
                               distance_scale=distance_scale,
-                              hit_threshold=hit_threshold,
-                              hit_at_neg=hit_at_neg,
+                              min_step=min_step,
                               max_steps_between_compact=max_steps_between_compact,
                               max_march_iters=max_march_iters,
                               drop_alive_rate=drop_alive_rate)
 
-        # Scale rays direction to unit length
-        dir_norm = ray_tested["rays_d"].norm(dim=-1)
         rays_to_trace = {
             "rays_o": ray_tested["rays_o"],
-            "rays_d": ray_tested["rays_d"] / dir_norm[..., None],
-            "near": ray_tested["near"] * dir_norm,
-            "far": ray_tested["far"] * dir_norm,
-            "ray_inds": torch.arange(ray_tested["num_rays"], device=ray_tested["ray_inds"].device)
+            "rays_d": ray_tested["rays_d"],
+            "near": ray_tested["near"],
+            "far": ray_tested["far"]
         }
 
         rays_hit = tracer.trace(rays_to_trace, self.forward_sdf, print_debug_log=debug)
@@ -291,6 +287,12 @@ class NeusRendererMixin(ModelMixin):
                     volume_buffer["rgb"] = torch.zeros_like(ray_tested["rays_o"])[:, None]
                     volume_buffer["rgb"][rays_hit["idx"]] = \
                         net_out["radiances"][:, None].to(volume_buffer["rgb"].dtype)
+
+                import nr3d_lib_bindings._sphere_trace as _backend
+                rays_alive = tracer.backend.get_rays(_backend.ALIVE)
+                volume_buffer["opacity_alpha"][rays_alive["idx"]] = 1.
+                volume_buffer["rgb"][rays_alive["idx"]] = torch.tensor([1., 0., 0.], device=rays_alive["idx"].device)
+
             volume_buffer['details'] = {'render.num_per_ray': 1}
         return volume_buffer
 
@@ -785,237 +787,242 @@ class NeusRendererMixin(ModelMixin):
         # Coarse sampling
         #----------------
         if num_coarse > 0:
-            coarse_step_cfg = coarse_step_cfg.copy()
-            step_mode = coarse_step_cfg.pop('step_mode')
-            if step_mode == 'linear':
-                depths_coarse_1, deltas_coarse_1 = batch_sample_step_linear(near, far, num_coarse+1, perturb=perturb, return_dt=True, **coarse_step_cfg)
-            elif step_mode == 'depth':
-                depths_coarse_1, deltas_coarse_1 = batch_sample_step_wrt_depth(near, far, num_coarse+1, perturb=perturb, return_dt=True, **coarse_step_cfg)
-            elif step_mode == 'sqrt_depth':
-                depths_coarse_1, deltas_coarse_1 = batch_sample_step_wrt_sqrt_depth(near, far, num_coarse+1, perturb=perturb, return_dt=True, **coarse_step_cfg)
-            else:
-                raise RuntimeError(f"Invalid step_mode={step_mode}")
-            # alpha_coarse = neus_ray_sdf_to_alpha(self.forward_sdf(torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse_1.unsqueeze(-1)))['sdf'], forward_inv_s)
-            deltas_coarse = deltas_coarse_1[..., :num_coarse]
-            depths_coarse = depths_coarse_1[..., :num_coarse] + deltas_coarse / 2.
-            # samples_coarse = torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse.unsqueeze(-1))
-            # sample_dirs, sample_dir_scales = view_dirs.unsqueeze(-2), dir_scale.unsqueeze(-1)
-            # net_out = self.forward(samples_coarse, sample_dirs if use_view_dirs else None, nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
-            # sdf_coarse, nablas_coarse, radiances_coarse = net_out['sdf'], net_out['nablas'], net_out['radiances']
+            with profile("Coarse sampling"):
+                coarse_step_cfg = coarse_step_cfg.copy()
+                step_mode = coarse_step_cfg.pop('step_mode')
+                if step_mode == 'linear':
+                    depths_coarse_1, deltas_coarse_1 = batch_sample_step_linear(near, far, num_coarse+1, perturb=perturb, return_dt=True, **coarse_step_cfg)
+                elif step_mode == 'depth':
+                    depths_coarse_1, deltas_coarse_1 = batch_sample_step_wrt_depth(near, far, num_coarse+1, perturb=perturb, return_dt=True, **coarse_step_cfg)
+                elif step_mode == 'sqrt_depth':
+                    depths_coarse_1, deltas_coarse_1 = batch_sample_step_wrt_sqrt_depth(near, far, num_coarse+1, perturb=perturb, return_dt=True, **coarse_step_cfg)
+                else:
+                    raise RuntimeError(f"Invalid step_mode={step_mode}")
+                # alpha_coarse = neus_ray_sdf_to_alpha(self.forward_sdf(torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse_1.unsqueeze(-1)))['sdf'], forward_inv_s)
+                deltas_coarse = deltas_coarse_1[..., :num_coarse]
+                depths_coarse = depths_coarse_1[..., :num_coarse] + deltas_coarse / 2.
+                # samples_coarse = torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse.unsqueeze(-1))
+                # sample_dirs, sample_dir_scales = view_dirs.unsqueeze(-2), dir_scale.unsqueeze(-1)
+                # net_out = self.forward(samples_coarse, sample_dirs if use_view_dirs else None, nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
+                # sdf_coarse, nablas_coarse, radiances_coarse = net_out['sdf'], net_out['nablas'], net_out['radiances']
 
         #----------------
         # Ray marching
         #----------------
-        # raymarch_fix_continuity = config.get('raymarch_fix_continuity', True)
-        ridx_hit, samples, depth_samples, _, _, pack_infos, _, _ = \
-            self.accel.ray_march(rays_o, rays_d, near, far, perturb=perturb, **march_cfg)
+        with profile("Ray marching"):
+            # raymarch_fix_continuity = config.get('raymarch_fix_continuity', True)
+            ridx_hit, samples, depth_samples, _, _, pack_infos, _, _ = \
+                self.accel.ray_march(rays_o, rays_d, near, far, perturb=perturb, **march_cfg)
 
         #----------------
         # Upsampling & gather volume_buffer
         #----------------
         if ridx_hit is not None:
-            pack_infos_marched = pack_infos.clone()
-            # [num_rays_hit, 1, 3], [num_rays_hit, 1]
-            rays_o_hit, rays_d_hit = rays_o[ridx_hit].unsqueeze(-2), rays_d[ridx_hit].unsqueeze(-2) # 27 us @ 9.6k rays; 80 us @ 500k rays
-            
-            #----------------
-            # Upsample on marched samples
-            with torch.no_grad():
-                sdf = batchify_query(lambda x: self.forward_sdf(x)['sdf'], samples, chunk=chunksize_query)
-                # sdf = self.forward_sdf(samples)['sdf']
+            with profile("Upsampling"):
+                pack_infos_marched = pack_infos.clone()
+                # [num_rays_hit, 1, 3], [num_rays_hit, 1]
+                rays_o_hit, rays_d_hit = rays_o[ridx_hit].unsqueeze(-2), rays_d[ridx_hit].unsqueeze(-2) # 27 us @ 9.6k rays; 80 us @ 500k rays
                 
-                depths_1 = []
-                
-                for i, factor in enumerate(upsample_inv_s_factors):
-                    pinfo_fine_per_iter = get_pack_infos_from_batch(ridx_hit.numel(), num_fine[i], device=device)
+                #----------------
+                # Upsample on marched samples
+                with torch.no_grad():
+                    sdf = batchify_query(lambda x: self.forward_sdf(x)['sdf'], samples, chunk=chunksize_query)
+                    # sdf = self.forward_sdf(samples)['sdf']
                     
-                    if upsample_use_estimate_alpha:
-                        alpha = neus_packed_sdf_to_upsample_alpha(sdf, depth_samples, upsample_inv_s * factor, pack_infos) # This could leads to artifacts
-                    else:
-                        alpha = neus_packed_sdf_to_alpha(sdf, upsample_inv_s * factor, pack_infos)
+                    depths_1 = []
                     
-                    # if raymarch_fix_continuity and (con_pack_infos is not None):
-                    #     con_last_inds = con_pack_infos[...,0] + con_pack_infos[...,1] - 1
-                    #     alpha[con_last_inds] = 0.  # To fix wrong alpha results between consecutive segments
-                    vw = packed_alpha_to_vw(alpha, pack_infos)
-                    
-                    neus_cdf = packed_cumsum(vw, pack_infos, exclusive=True)
-                    last_cdf = neus_cdf[pack_infos[...,0] + pack_infos[...,1] - 1]
-                    neus_cdf = packed_div(neus_cdf, last_cdf.clamp_min(1e-5), pack_infos)
-                    depths_fine_iter = packed_sample_cdf(depth_samples, neus_cdf.to(depth_samples.dtype), pack_infos, num_fine[i], perturb=perturb)[0]
-                    depths_1.append(depths_fine_iter)
+                    for i, factor in enumerate(upsample_inv_s_factors):
+                        pinfo_fine_per_iter = get_pack_infos_from_batch(ridx_hit.numel(), num_fine[i], device=device)
+                        
+                        if upsample_use_estimate_alpha:
+                            alpha = neus_packed_sdf_to_upsample_alpha(sdf, depth_samples, upsample_inv_s * factor, pack_infos) # This could leads to artifacts
+                        else:
+                            alpha = neus_packed_sdf_to_alpha(sdf, upsample_inv_s * factor, pack_infos)
+                        
+                        # if raymarch_fix_continuity and (con_pack_infos is not None):
+                        #     con_last_inds = con_pack_infos[...,0] + con_pack_infos[...,1] - 1
+                        #     alpha[con_last_inds] = 0.  # To fix wrong alpha results between consecutive segments
+                        vw = packed_alpha_to_vw(alpha, pack_infos)
+                        
+                        neus_cdf = packed_cumsum(vw, pack_infos, exclusive=True)
+                        last_cdf = neus_cdf[pack_infos[...,0] + pack_infos[...,1] - 1]
+                        neus_cdf = packed_div(neus_cdf, last_cdf.clamp_min(1e-5), pack_infos)
+                        depths_fine_iter = packed_sample_cdf(depth_samples, neus_cdf.to(depth_samples.dtype), pack_infos, num_fine[i], perturb=perturb)[0]
+                        depths_1.append(depths_fine_iter)
 
+                        if len(upsample_inv_s_factors) > 1:
+                            # 273 us @ 930k + 25k
+                            # Merge fine samples of current upsample iter to previous packed buffer.
+                            # NOTE: The new `pack_infos` is calculated here.
+                            pidx0, pidx1, pack_infos = merge_two_packs_sorted_aligned(depth_samples, pack_infos, depths_fine_iter.flatten(), pinfo_fine_per_iter, b_sorted=True, return_val=False)
+                            num_samples_iter = depth_samples.numel()
+                            depth_samples_iter = depth_samples.new_empty([num_samples_iter + depths_fine_iter.numel()])
+                            depth_samples_iter[pidx0], depth_samples_iter[pidx1] = depth_samples, depths_fine_iter.flatten()
+                            depth_samples = depth_samples_iter
+
+                            if i < len(upsample_inv_s_factors)-1:
+                                x_fine = torch.addcmul(rays_o_hit, rays_d_hit, depths_fine_iter.unsqueeze(-1))
+                                sdf_iter = sdf.new_empty([num_samples_iter + depths_fine_iter.numel()])
+                                sdf_iter[pidx0], sdf_iter[pidx1] = sdf, self.forward_sdf(x_fine.flatten(0, -2))['sdf']
+                                sdf = sdf_iter
+                    
                     if len(upsample_inv_s_factors) > 1:
-                        # 273 us @ 930k + 25k
-                        # Merge fine samples of current upsample iter to previous packed buffer.
-                        # NOTE: The new `pack_infos` is calculated here.
-                        pidx0, pidx1, pack_infos = merge_two_packs_sorted_aligned(depth_samples, pack_infos, depths_fine_iter.flatten(), pinfo_fine_per_iter, b_sorted=True, return_val=False)
-                        num_samples_iter = depth_samples.numel()
-                        depth_samples_iter = depth_samples.new_empty([num_samples_iter + depths_fine_iter.numel()])
-                        depth_samples_iter[pidx0], depth_samples_iter[pidx1] = depth_samples, depths_fine_iter.flatten()
-                        depth_samples = depth_samples_iter
-
-                        if i < len(upsample_inv_s_factors)-1:
-                            x_fine = torch.addcmul(rays_o_hit, rays_d_hit, depths_fine_iter.unsqueeze(-1))
-                            sdf_iter = sdf.new_empty([num_samples_iter + depths_fine_iter.numel()])
-                            sdf_iter[pidx0], sdf_iter[pidx1] = sdf, self.forward_sdf(x_fine.flatten(0, -2))['sdf']
-                            sdf = sdf_iter
-                
-                if len(upsample_inv_s_factors) > 1:
-                    depths_1 = torch.cat(depths_1, dim=-1).sort(dim=-1).values
-                else:
-                    depths_1 = depths_1[0]
+                        depths_1 = torch.cat(depths_1, dim=-1).sort(dim=-1).values
+                    else:
+                        depths_1 = depths_1[0]
             
             #----------------
             # Acquire volume_buffer via quering network and gather results
-            if num_coarse == 0:
-                # [num_rays_hit, num_fine_all]
-                if self.training:
-                    alpha = neus_ray_sdf_to_alpha(
-                        self.forward_sdf(torch.addcmul(rays_o_hit, rays_d_hit, depths_1.unsqueeze(-1)))['sdf'], 
-                        forward_inv_s)
-                else:
-                    alpha = neus_ray_sdf_to_alpha(
-                        batchify_query(
-                            lambda x: self.forward_sdf(x)['sdf'], 
-                            torch.addcmul(rays_o_hit, rays_d_hit, depths_1.unsqueeze(-1)), 
-                            chunk=chunksize_query), 
-                        forward_inv_s)
-                depths = (depths_1[..., :-1] + depths_1.diff(dim=-1)/2.)
-                
-                pack_infos_hit = get_pack_infos_from_batch(ridx_hit.numel(), depths.shape[-1], device=device)
-                nidx_useful, pack_infos_hit_useful, pidx_useful = packed_volume_render_compression(alpha.flatten(), pack_infos_hit)
-                
-                if nidx_useful.numel() == 0:
-                    return empty_volume_buffer
-                else:
-                    depths_packed, alpha_packed = depths.flatten()[pidx_useful], alpha.flatten()[pidx_useful]
+            with profile("Acquire volume buffer"):
+                if num_coarse == 0:
+                    # [num_rays_hit, num_fine_all]
+                    if self.training:
+                        alpha = neus_ray_sdf_to_alpha(
+                            self.forward_sdf(torch.addcmul(rays_o_hit, rays_d_hit, depths_1.unsqueeze(-1)))['sdf'], 
+                            forward_inv_s)
+                    else:
+                        alpha = neus_ray_sdf_to_alpha(
+                            batchify_query(
+                                lambda x: self.forward_sdf(x)['sdf'], 
+                                torch.addcmul(rays_o_hit, rays_d_hit, depths_1.unsqueeze(-1)), 
+                                chunk=chunksize_query), 
+                            forward_inv_s)
+                    depths = (depths_1[..., :-1] + depths_1.diff(dim=-1)/2.)
+                    
+                    pack_infos_hit = get_pack_infos_from_batch(ridx_hit.numel(), depths.shape[-1], device=device)
+                    nidx_useful, pack_infos_hit_useful, pidx_useful = packed_volume_render_compression(alpha.flatten(), pack_infos_hit)
+                    
+                    if nidx_useful.numel() == 0:
+                        return empty_volume_buffer
+                    else:
+                        depths_packed, alpha_packed = depths.flatten()[pidx_useful], alpha.flatten()[pidx_useful]
 
-                    volume_buffer = dict(
-                        buffer_type='packed', 
-                        ray_inds_hit=ray_inds[ridx_hit][nidx_useful], pack_infos_hit=pack_infos_hit_useful, 
-                        t=depths_packed.to(dtype), opacity_alpha=alpha_packed.to(dtype))
-                    
-                    if with_rgb or with_normal:
-                        ridx_all = ridx_hit.unsqueeze(-1).expand(-1,depths.shape[-1]).flatten()[pidx_useful]
-                        # Get embedding code
-                        h_appear_embed = ray_tested["rays_h_appear_embed"][ridx_all]\
-                            if ray_tested.get('rays_h_appear_embed', None) is not None else None
-                        pts_mid = torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_packed.unsqueeze(-1))
-                        #----------- Net query
-                        # [num_rays_hit, num_fine_all, ...]
-                        net_out = self.forward(
-                            x=pts_mid, 
-                            v=view_dirs[ridx_all] if use_view_dirs else None,
-                            h_appear_embed=h_appear_embed,
-                            nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
-                        volume_buffer['net_x'] = pts_mid
-                        if "nablas" in net_out: volume_buffer["nablas"] = net_out["nablas"].to(dtype)
-                        if "radiances" in net_out: volume_buffer["rgb"] = net_out["radiances"].to(dtype)
-                    volume_buffer['details'] = {'march.num_per_ray': pack_infos_marched[:, 1], 'render.num_per_ray0': depths.shape[-1], 'render.num_per_ray': pack_infos_hit_useful[:, 1]}
-                    return volume_buffer
+                        volume_buffer = dict(
+                            buffer_type='packed', 
+                            ray_inds_hit=ray_inds[ridx_hit][nidx_useful], pack_infos_hit=pack_infos_hit_useful, 
+                            t=depths_packed.to(dtype), opacity_alpha=alpha_packed.to(dtype))
+                        
+                        if with_rgb or with_normal:
+                            ridx_all = ridx_hit.unsqueeze(-1).expand(-1,depths.shape[-1]).flatten()[pidx_useful]
+                            # Get embedding code
+                            h_appear_embed = ray_tested["rays_h_appear_embed"][ridx_all]\
+                                if ray_tested.get('rays_h_appear_embed', None) is not None else None
+                            pts_mid = torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_packed.unsqueeze(-1))
+                            #----------- Net query
+                            # [num_rays_hit, num_fine_all, ...]
+                            net_out = self.forward(
+                                x=pts_mid, 
+                                v=view_dirs[ridx_all] if use_view_dirs else None,
+                                h_appear_embed=h_appear_embed,
+                                nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
+                            volume_buffer['net_x'] = pts_mid
+                            if "nablas" in net_out: volume_buffer["nablas"] = net_out["nablas"].to(dtype)
+                            if "radiances" in net_out: volume_buffer["rgb"] = net_out["radiances"].to(dtype)
+                        volume_buffer['details'] = {'march.num_per_ray': pack_infos_marched[:, 1], 'render.num_per_ray0': depths.shape[-1], 'render.num_per_ray': pack_infos_hit_useful[:, 1]}
+                        return volume_buffer
 
-            else:
-                def merge():
-                    ridx_coarse = torch.arange(ray_inds.numel(), device=device)
-                    pidx0, pidx1, pack_infos = merge_two_batch_a_includes_b(depths_coarse_1, ridx_coarse, depths_1, ridx_hit, a_sorted=True)
-                    num_samples = depths_1.numel() + depths_coarse_1.numel()
-                    depths_1_packed = depths_1.new_zeros([num_samples])
-                    ridx_all = ridx_hit.new_zeros([num_samples])
-                    ridx_all[pidx0], ridx_all[pidx1] = ridx_coarse.unsqueeze(-1), ridx_hit.unsqueeze(-1)
-                    depths_1_packed[pidx0], depths_1_packed[pidx1] = depths_coarse_1, depths_1
-                    return ridx_all, depths_1_packed, pack_infos
-                
-                ridx_all, depths_1_packed, pack_infos_hit = merge()
-                depths_packed = depths_1_packed + packed_diff(depths_1_packed, pack_infos_hit) / 2.
-                
-                if self.training:
-                    alpha_packed = neus_packed_sdf_to_alpha(
-                        self.forward_sdf(torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_1_packed.unsqueeze(-1)))['sdf'], 
-                        forward_inv_s, pack_infos_hit)
                 else:
-                    alpha_packed = neus_packed_sdf_to_alpha(
-                        batchify_query(
-                            lambda x: self.forward_sdf(x)['sdf'], 
-                            torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_1_packed.unsqueeze(-1)), 
-                            chunk=chunksize_query), 
-                        forward_inv_s, pack_infos_hit)
-                nidx_useful, pack_infos_hit_useful, pidx_useful = packed_volume_render_compression(alpha_packed, pack_infos_hit)
-                
-                if nidx_useful.numel() == 0:
-                    return empty_volume_buffer
-                else:
-                    # Update
-                    ridx_all, depths_packed, alpha_packed  = ridx_all[pidx_useful], depths_packed[pidx_useful], alpha_packed[pidx_useful]
+                    def merge():
+                        ridx_coarse = torch.arange(ray_inds.numel(), device=device)
+                        pidx0, pidx1, pack_infos = merge_two_batch_a_includes_b(depths_coarse_1, ridx_coarse, depths_1, ridx_hit, a_sorted=True)
+                        num_samples = depths_1.numel() + depths_coarse_1.numel()
+                        depths_1_packed = depths_1.new_zeros([num_samples])
+                        ridx_all = ridx_hit.new_zeros([num_samples])
+                        ridx_all[pidx0], ridx_all[pidx1] = ridx_coarse.unsqueeze(-1), ridx_hit.unsqueeze(-1)
+                        depths_1_packed[pidx0], depths_1_packed[pidx1] = depths_coarse_1, depths_1
+                        return ridx_all, depths_1_packed, pack_infos
                     
-                    volume_buffer = dict(
-                        buffer_type='packed', 
-                        ray_inds_hit=ray_inds[nidx_useful], pack_infos_hit=pack_infos_hit_useful, 
-                        t=depths_packed.to(dtype), opacity_alpha=alpha_packed.to(dtype))
+                    ridx_all, depths_1_packed, pack_infos_hit = merge()
+                    depths_packed = depths_1_packed + packed_diff(depths_1_packed, pack_infos_hit) / 2.
                     
-                    if with_rgb or with_normal:
-                        # Get embedding code
-                        h_appear_embed = ray_tested["rays_h_appear_embed"][ridx_all]\
-                            if ray_tested.get('rays_h_appear_embed', None) is not None else None
-                        pts_mid = torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_packed.unsqueeze(-1))
-                        net_out = self.forward(
-                            x=pts_mid, 
-                            v=view_dirs[ridx_all] if use_view_dirs else None, 
-                            h_appear_embed=h_appear_embed,
-                            nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
-                        volume_buffer['net_x'] = pts_mid
-                        if "nablas" in net_out: volume_buffer["nablas"] = net_out["nablas"].to(dtype)
-                        if "radiances" in net_out: volume_buffer["rgb"] = net_out["radiances"].to(dtype)
-                    volume_buffer['details'] = {'march.num_per_ray': pack_infos_marched[:, 1], 'render.num_per_ray0': pack_infos_hit[:, 1], 'render.num_per_ray': pack_infos_hit_useful[:, 1]}
-                    return volume_buffer
+                    if self.training:
+                        alpha_packed = neus_packed_sdf_to_alpha(
+                            self.forward_sdf(torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_1_packed.unsqueeze(-1)))['sdf'], 
+                            forward_inv_s, pack_infos_hit)
+                    else:
+                        alpha_packed = neus_packed_sdf_to_alpha(
+                            batchify_query(
+                                lambda x: self.forward_sdf(x)['sdf'], 
+                                torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_1_packed.unsqueeze(-1)), 
+                                chunk=chunksize_query), 
+                            forward_inv_s, pack_infos_hit)
+                    nidx_useful, pack_infos_hit_useful, pidx_useful = packed_volume_render_compression(alpha_packed, pack_infos_hit)
+                    
+                    if nidx_useful.numel() == 0:
+                        return empty_volume_buffer
+                    else:
+                        # Update
+                        ridx_all, depths_packed, alpha_packed  = ridx_all[pidx_useful], depths_packed[pidx_useful], alpha_packed[pidx_useful]
+                        
+                        volume_buffer = dict(
+                            buffer_type='packed', 
+                            ray_inds_hit=ray_inds[nidx_useful], pack_infos_hit=pack_infos_hit_useful, 
+                            t=depths_packed.to(dtype), opacity_alpha=alpha_packed.to(dtype))
+                        
+                        if with_rgb or with_normal:
+                            # Get embedding code
+                            h_appear_embed = ray_tested["rays_h_appear_embed"][ridx_all]\
+                                if ray_tested.get('rays_h_appear_embed', None) is not None else None
+                            pts_mid = torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_packed.unsqueeze(-1))
+                            net_out = self.forward(
+                                x=pts_mid, 
+                                v=view_dirs[ridx_all] if use_view_dirs else None, 
+                                h_appear_embed=h_appear_embed,
+                                nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
+                            volume_buffer['net_x'] = pts_mid
+                            if "nablas" in net_out: volume_buffer["nablas"] = net_out["nablas"].to(dtype)
+                            if "radiances" in net_out: volume_buffer["rgb"] = net_out["radiances"].to(dtype)
+                        volume_buffer['details'] = {'march.num_per_ray': pack_infos_marched[:, 1], 'render.num_per_ray0': pack_infos_hit[:, 1], 'render.num_per_ray': pack_infos_hit_useful[:, 1]}
+                        return volume_buffer
 
         else: # ridx_hit is None
             if num_coarse == 0: # ridx_hit is None and num_coarse == 0
                 return empty_volume_buffer
             
             else: # ridx_hit is None and num_coarse > 0
-                if self.training:
-                    alpha_coarse = neus_ray_sdf_to_alpha(
-                        self.forward_sdf(torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse_1.unsqueeze(-1)))['sdf'], 
-                        forward_inv_s)
-                else:
-                    alpha_coarse = neus_ray_sdf_to_alpha(
-                        batchify_query(
-                            lambda x: self.forward_sdf(x)['sdf'], 
-                            torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse_1.unsqueeze(-1)), 
-                            chunk=chunksize_query), 
-                        forward_inv_s)
-                depths_coarse = depths_coarse_1[..., :num_coarse] + deltas_coarse_1[..., :num_coarse] / 2.
-                
-                pack_infos_coarse = get_pack_infos_from_batch(num_rays, depths_coarse.shape[-1], device=device)
-                nidx_useful, pack_infos_hit_useful, pidx_useful = packed_volume_render_compression(alpha_coarse.flatten(), pack_infos_coarse)
-                
-                if nidx_useful.numel() == 0:
-                    return empty_volume_buffer
-                else:
-                    depths_packed, alpha_packed = depths_coarse.flatten()[pidx_useful], alpha_coarse.flatten()[pidx_useful]
+                with profile("Acquire volume buffer"):
+                    if self.training:
+                        alpha_coarse = neus_ray_sdf_to_alpha(
+                            self.forward_sdf(torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse_1.unsqueeze(-1)))['sdf'], 
+                            forward_inv_s)
+                    else:
+                        alpha_coarse = neus_ray_sdf_to_alpha(
+                            batchify_query(
+                                lambda x: self.forward_sdf(x)['sdf'], 
+                                torch.addcmul(rays_o.unsqueeze(-2), rays_d.unsqueeze(-2), depths_coarse_1.unsqueeze(-1)), 
+                                chunk=chunksize_query), 
+                            forward_inv_s)
+                    depths_coarse = depths_coarse_1[..., :num_coarse] + deltas_coarse_1[..., :num_coarse] / 2.
+                    
+                    pack_infos_coarse = get_pack_infos_from_batch(num_rays, depths_coarse.shape[-1], device=device)
+                    nidx_useful, pack_infos_hit_useful, pidx_useful = packed_volume_render_compression(alpha_coarse.flatten(), pack_infos_coarse)
+                    
+                    if nidx_useful.numel() == 0:
+                        return empty_volume_buffer
+                    else:
+                        depths_packed, alpha_packed = depths_coarse.flatten()[pidx_useful], alpha_coarse.flatten()[pidx_useful]
 
-                    volume_buffer = dict(
-                        buffer_type='packed', 
-                        ray_inds_hit=ray_inds[nidx_useful], pack_infos_hit=pack_infos_hit_useful, 
-                        t=depths_packed.to(dtype), opacity_alpha=alpha_packed.to(dtype))
+                        volume_buffer = dict(
+                            buffer_type='packed', 
+                            ray_inds_hit=ray_inds[nidx_useful], pack_infos_hit=pack_infos_hit_useful, 
+                            t=depths_packed.to(dtype), opacity_alpha=alpha_packed.to(dtype))
 
-                    if with_rgb or with_normal:
-                        ridx_all = torch.arange(ray_inds.numel(), device=device).unsqueeze_(-1).expand_as(alpha_coarse).flatten()[pidx_useful]
-                        # Get embedding code
-                        h_appear_embed = ray_tested["rays_h_appear_embed"][ridx_all]\
-                            if ray_tested.get('rays_h_appear_embed', None) is not None else None
-                        pts_mid = torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_packed.unsqueeze(-1))
-                        net_out = self.forward(
-                            x=pts_mid, 
-                            v=view_dirs[ridx_all] if use_view_dirs else None, 
-                            h_appear_embed=h_appear_embed,
-                            nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
-                        volume_buffer['net_x'] = pts_mid
-                        if "nablas" in net_out: volume_buffer["nablas"] = net_out["nablas"].to(dtype)
-                        if "radiances" in net_out: volume_buffer["rgb"] = net_out["radiances"].to(dtype)
-                    volume_buffer['details'] = {'render.num_per_ray0': num_coarse, 'render.num_per_ray': pack_infos_hit_useful[:, 1]}
-                    return volume_buffer
+                        if with_rgb or with_normal:
+                            ridx_all = torch.arange(ray_inds.numel(), device=device).unsqueeze_(-1).expand_as(alpha_coarse).flatten()[pidx_useful]
+                            # Get embedding code
+                            h_appear_embed = ray_tested["rays_h_appear_embed"][ridx_all]\
+                                if ray_tested.get('rays_h_appear_embed', None) is not None else None
+                            pts_mid = torch.addcmul(rays_o[ridx_all], rays_d[ridx_all], depths_packed.unsqueeze(-1))
+                            net_out = self.forward(
+                                x=pts_mid, 
+                                v=view_dirs[ridx_all] if use_view_dirs else None, 
+                                h_appear_embed=h_appear_embed,
+                                nablas_has_grad=nablas_has_grad, with_rgb=with_rgb, with_normal=with_normal)
+                            volume_buffer['net_x'] = pts_mid
+                            if "nablas" in net_out: volume_buffer["nablas"] = net_out["nablas"].to(dtype)
+                            if "radiances" in net_out: volume_buffer["rgb"] = net_out["radiances"].to(dtype)
+                        volume_buffer['details'] = {'render.num_per_ray0': num_coarse, 'render.num_per_ray': pack_infos_hit_useful[:, 1]}
+                        return volume_buffer
 
     @profile
     def _ray_query_march_occ_multi_upsample_compressed_strategy(

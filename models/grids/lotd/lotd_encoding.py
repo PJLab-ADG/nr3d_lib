@@ -23,9 +23,9 @@ from nr3d_lib.utils import tensor_statistics, torch_dtype
 from nr3d_lib.models.spatial import AABBSpace
 from nr3d_lib.models.utils import batchify_query, clip_norm_
 from nr3d_lib.models.grids.lotd.lotd import LoTD, LoDType
+from nr3d_lib.models.grids.lotd.lotd_cfg import get_lotd_cfg
 from nr3d_lib.models.grids.lotd.lotd_helpers import LoTDAnnealer, \
-    auto_compute_lotd_cfg_deprecated, auto_compute_ngp_cfg, auto_compute_ngp4d_cfg, \
-    gen_ngp_cfg, param_interpolate, param_vertices, level_param_index_shape
+    param_interpolate, param_vertices, level_param_index_shape
 
 try:
     import tensorly
@@ -63,21 +63,9 @@ class LoTDEncoding(nn.Module):
         #------- LoTD Metadata
         assert bool(lotd_cfg is not None) != bool(lotd_auto_compute_cfg is not None), "Please specify one and only one of `lotd_cfg` and `lotd_auto_compute_cfg`"
         if lotd_auto_compute_cfg is not None:
-            aspect_ratio = 1 if not lotd_use_cuboid else self.space.stretch.tolist()
-            lotd_auto_compute_cfg = lotd_auto_compute_cfg.copy()
-            if (auto_compute_type:=lotd_auto_compute_cfg.pop('type')) == 'gen_ngp':
-                lotd_cfg = gen_ngp_cfg(dim=input_ch, **lotd_auto_compute_cfg)
-            elif auto_compute_type == 'ngp':
-                lotd_cfg = auto_compute_ngp_cfg(aspect_ratio, dim=input_ch, 
-                                                **lotd_auto_compute_cfg)
-            elif auto_compute_type == 'ngp4d':
-                lotd_cfg = auto_compute_ngp4d_cfg(dim=input_ch, stretch=aspect_ratio,
-                                                  **lotd_auto_compute_cfg)
-            elif auto_compute_type == 'lotd':
-                lotd_cfg = auto_compute_lotd_cfg_deprecated(aspect_ratio, dim=input_ch,
-                                                            **lotd_auto_compute_cfg)
-            else:
-                raise RuntimeError(f"Invalid auto_compute_type={auto_compute_type}")
+            lotd_cfg = get_lotd_cfg(
+                **lotd_auto_compute_cfg, input_ch=input_ch, 
+                stretch=(1 if not lotd_use_cuboid else self.space.stretch.tolist()))
         
         self.lotd_cfg = lotd_cfg.to_dict() if not isinstance(lotd_cfg, dict) else lotd_cfg
         self.lotd = LoTD(input_ch, **lotd_cfg, dtype=self.dtype, device=self.device)

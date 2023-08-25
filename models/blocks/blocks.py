@@ -20,6 +20,7 @@ from nr3d_lib.fmt import log
 from nr3d_lib.utils import check_to_torch, torch_dtype
 from nr3d_lib.models.layers import get_nonlinearity, DenseLayer
 from nr3d_lib.models.embedders import get_embedder
+from nr3d_lib.profile import profile
 
 
 class FCBlock(nn.Module):
@@ -102,6 +103,7 @@ class FCBlock(nn.Module):
     def get_weight_reg(self, norm_type: float = 2.0):
         return torch.stack([p.norm(p=norm_type) for n,p in self.layers.named_parameters()])
     
+    @profile
     def forward(self, x: torch.Tensor, return_last: bool=False, input_max_channel: int = None):
         for i, layer in enumerate(self.layers):
             if i == 0:
@@ -218,6 +220,7 @@ class LipshitzMLP(FCBlock):
         # NOTE: Not include `lipshitz_bound_per_layer``
         return torch.stack([p.norm(p=norm_type) for n,p in self.layers.named_parameters()])
 
+    @profile
     def forward(self, x: torch.Tensor, return_last: bool=False):
         h = x
         for i, layer in enumerate(self.layers):

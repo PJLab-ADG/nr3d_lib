@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 from torch.autograd.function import once_differentiable
 
+from nr3d_lib.profile import profile
 import nr3d_lib_bindings._lotd as _backend
 
 class LoDType(Enum):
@@ -402,6 +403,7 @@ class LoTD(nn.Module):
         """[n_levels] Grid parameter sizes for each actual `level` (considering feature width)"""
         return self.meta.level_n_params
     
+    @profile
     def forward(self, input: torch.Tensor, params: torch.Tensor, batch_inds: torch.Tensor = None, batch_offsets: torch.Tensor = None, input_batched=False, max_level: int=None) -> torch.Tensor:
         if input_batched:
             assert batch_inds is None, 'batch_inds is only taken care of when input is not batched.'
@@ -411,6 +413,7 @@ class LoTD(nn.Module):
         output = LoTDFunction.apply(self.meta, input, params.to(self.dtype), batch_inds, batch_offsets, batch_data_size, self.loss_scale, max_level)
         return output
     
+    @profile
     def forward_dydx(self, input: torch.Tensor, params: torch.Tensor, batch_inds: torch.Tensor = None, batch_offsets: torch.Tensor = None, input_batched=False, max_level: int=None, need_loss_backward_input=False) -> Tuple[torch.Tensor, torch.Tensor]:
         if input_batched:
             assert batch_inds is None, 'batch_inds is only taken care of when input is not batched.'
@@ -420,6 +423,7 @@ class LoTD(nn.Module):
         output, dy_dx = LoTDFunctionFwdDydx.apply(self.meta, input, params.to(self.dtype), batch_inds, batch_offsets, batch_data_size, self.loss_scale, max_level, need_loss_backward_input)
         return output, dy_dx
     
+    @profile
     def backward_dydx(self, dL_dy: torch.Tensor, dy_dx: torch.Tensor, input: torch.Tensor, params: torch.Tensor, batch_inds: torch.Tensor = None, batch_offsets: torch.Tensor = None, input_batched=False, max_level: int=None, grad_guard=None) -> torch.Tensor:
         if input_batched:
             assert batch_inds is None, 'batch_inds is only taken care of when input is not batched.'

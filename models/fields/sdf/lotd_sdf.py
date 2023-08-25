@@ -18,6 +18,7 @@ from torch import autograd
 
 from nr3d_lib.logger import Logger
 from nr3d_lib.config import ConfigDict
+from nr3d_lib.profile import profile
 from nr3d_lib.utils import tensor_statistics, torch_dtype
 
 from nr3d_lib.models.utils import clip_norm_
@@ -130,6 +131,7 @@ class LoTDSDF(ModelMixin, nn.Module):
     def preprocess_per_train_step(self, cur_it: int, logger: Logger = None):
         self.encoding.set_anneal_iter(cur_it)
 
+    @profile
     def forward(
         self, x: torch.Tensor, *, input_normalized=True, 
         return_h=False, max_level: int = None) -> Dict[str, torch.Tensor]:
@@ -154,7 +156,7 @@ class LoTDSDF(ModelMixin, nn.Module):
         self, x: torch.Tensor, *, input_normalized=True, max_level: int = None):
         return self.forward(x, input_normalized=input_normalized, return_h=False, max_level=max_level)
 
-    # @profile
+    @profile
     def forward_sdf_nablas(
         self, x: torch.Tensor, *, input_normalized=True, 
         has_grad:bool=None, nablas_has_grad:bool=None, 

@@ -15,6 +15,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from nr3d_lib.profile import profile
+
+
 class SinusoidalEmbedder(nn.Module):
     def __init__(
         self, 
@@ -50,6 +53,7 @@ class SinusoidalEmbedder(nn.Module):
             freq_bands = torch.linspace(2. ** min_freq_log2, 2. ** max_freq_log2, N_freqs)
         self.register_buffer('freq_bands', freq_bands, persistent=False)
 
+    @profile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
 
@@ -86,6 +90,8 @@ class AnnealedSinusoidalEmbedder(SinusoidalEmbedder):
         super().__init__(*args, **kwargs)
         self.register_buffer('alpha', torch.tensor([1.0]), persistent=True)
         self.set_cosine_easing_window(self.alpha)
+    
+    @profile
     def forward(self, x: torch.Tensor):
         assert hasattr(self, 'window'), "Must call set_cosine_easing_window(alpha)"
         assert (x.shape[-1] == self.input_dim)

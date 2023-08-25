@@ -1,5 +1,6 @@
 
 from .lotd import *
+from .lotd_cfg import *
 from .lotd_helpers import *
 
 from .lotd_encoding import *

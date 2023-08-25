@@ -10,6 +10,7 @@ from typing import List, Literal
 
 from nr3d_lib.fmt import log
 from nr3d_lib.config import ConfigDict
+from nr3d_lib.profile import profile
 
 try:
     import tinycudann as tcnn
@@ -87,6 +88,8 @@ try:
             super().__init__(in_features, out_features, network_config=network_config, seed=seed)
             self.in_features = self.n_input_dims
             self.out_features = self.n_output_dims
+        
+        @profile
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             prefix = x.shape[:-1]
             return super().forward(x.to(self.dtype).flatten(0, -2)).unflatten(0, prefix)
@@ -117,6 +120,8 @@ try:
             blocks.append(bl)
                 
             self.blocks = nn.ModuleList(blocks)
+        
+        @profile
         def forward(self, x: torch.Tensor):
             prefix = x.shape[:-1]
             x = x.flatten(0, -2)
@@ -148,7 +153,8 @@ try:
             else:
                 super().__init__(input_dim, c, seed=seed)
             self.out_features = self.n_output_dims
-            
+        
+        @profile
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             prefix = x.shape[:-1]
             if self.include_input:
@@ -182,7 +188,8 @@ try:
                 super().__init__(in_features * 2, out_features, encoding_cfg, network_cfg, seed=seed)
             else:
                 super().__init__(in_features, out_features, encoding_cfg, network_cfg, seed=seed)
-            
+        
+        @profile
         def forward(self, x: torch.Tensor):
             prefix = x.shape[:-1]
             if self.embed_include_input:
@@ -200,6 +207,8 @@ try:
             self.skips = skips
             self.encoding = TcnnEncoding(in_features, embed_cfg, encoding_bypass=encoding_bypass, seed=seed)
             self.blocks = TcnnFCBlockWSkips(self.encoding.out_features, out_features, D=D, W=W, skips=skips, activation=activation, output_activation=output_activation, seed=seed, use_cutlass=use_cutlass)
+        
+        @profile
         def forward(self, x: torch.Tensor):
             prefix = x.shape[:-1]
             h = self.encoding(x.flatten(0, -2))

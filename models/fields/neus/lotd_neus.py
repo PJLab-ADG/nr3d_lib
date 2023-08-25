@@ -117,14 +117,12 @@ class LoTDNeuS(ModelMixin, nn.Module):
     def forward_inv_s(self):
         return self.ctrl_var()
 
-    @profile
     def forward_sdf(self, x: torch.Tensor, *, return_h=False, input_normalized=True):
         return self.implicit_surface(x, return_h=return_h, max_level=self.max_level, input_normalized=input_normalized)
     
     def query_sdf(self, x: torch.Tensor, input_normalized=True) -> torch.Tensor:
         return self.forward_sdf(x, input_normalized=input_normalized)['sdf']
     
-    @profile
     def forward_sdf_nablas(
         self,  x: torch.Tensor, *, input_normalized=True, 
         has_grad: bool=None, nablas_has_grad: bool=None, grad_guard=None):

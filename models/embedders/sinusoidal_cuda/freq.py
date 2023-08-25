@@ -11,6 +11,7 @@ from torch.autograd.function import once_differentiable
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
 import nr3d_lib_bindings._freqencoder as _backend
+from nr3d_lib.profile import profile
 
 class _freq_encoder(Function):
     @staticmethod
@@ -67,6 +68,7 @@ class FreqEncoder(nn.Module):
     def __repr__(self):
         return f"FreqEncoder: input_dim={self.in_features}, output_dim={self.out_features}, n_frequencies={self.n_frequencies} "
     
+    @profile
     def forward(self, inputs, **kwargs) -> torch.Tensor:
         # inputs: [..., input_dim]
         # return: [..., ]

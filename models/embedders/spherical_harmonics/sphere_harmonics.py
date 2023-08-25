@@ -9,6 +9,7 @@ from torch.autograd.function import once_differentiable
 from torch.cuda.amp import custom_bwd, custom_fwd 
 
 import nr3d_lib_bindings._shencoder as _backend
+from nr3d_lib.profile import profile
 
 class _sh_encoder(Function):
     @staticmethod
@@ -68,6 +69,7 @@ class SHEncoder(nn.Module):
     def __repr__(self):
         return f"SHEncoder: input_dim={self.in_features}, output_dim={self.out_features}, degree={self.degree}"
     
+    @profile
     def forward(self, inputs: torch.Tensor, size=1) -> torch.Tensor:
         # inputs: [..., input_dim], normalized real world positions in [-size, size]
         # return: [..., degree^2]

@@ -25,10 +25,10 @@ class SphereTracer():
     """
 
     def __init__(self, grid: DenseGrid, *,
-                    zero_offset: float = 0.0, distance_scale: float = 0.95,
-                    hit_threshold: float = 5e-4, hit_at_neg: bool = False,
-                    max_steps_between_compact: int = 4, max_march_iters: int = 1000,
-                    drop_alive_rate: float = 0.):
+                 zero_offset: float = 0., distance_scale: float = 1.,
+                 min_step: float = .1,
+                 max_steps_between_compact: int = 4, max_march_iters: int = 1000,
+                 drop_alive_rate: float = 0.):
         """
         A class for performing sphere tracing.
 
@@ -41,12 +41,11 @@ class SphereTracer():
             max_steps_between_compact (int, optional): The maximum number of advancing steps between performing compaction of the traced rays. Defaults to 4.
             max_march_iters (int, optional): The maximum number of iterations to perform when marching along the trace. Defaults to 1000.
             drop_alive_rate (float, optional): The rate at which to drop alive rays. Defaults to 0..
-        """        
+        """
         self.grid = grid
         self.zero_offset = zero_offset
         self.distance_scale = distance_scale
-        self.hit_threshold = hit_threshold
-        self.hit_at_neg = hit_at_neg
+        self.min_step = min_step
         self.max_steps_between_compact = max_steps_between_compact
         self.max_march_iters = max_march_iters
         self.drop_alive_rate = drop_alive_rate
@@ -79,7 +78,7 @@ class SphereTracer():
                 voxel_idx (torch.Tensor[N']): The voxel indices of hit rays.
                 t (torch.Tensor[N']): The distances between the hit positions and the origins of hit rays.
                 n_steps (torch.Tensor[N']): The number of steps taken to reach the hit positions.
-        
+
         Remarks:
             N is the number of input rays.
             N' is the number of hit rays.
@@ -88,55 +87,50 @@ class SphereTracer():
         logger.handlers[0].setLevel(logging.DEBUG if print_debug_log else logging.INFO)
         n_rays = rays["rays_o"].shape[0]
         n_drop_alive = self.drop_alive_rate * n_rays
-        with profile("sphere_tracer.init_rays"):
-            self.backend.init_rays(*itemgetter("rays_o", "rays_d", "ray_inds", "near", "far")(rays),
-                                   self.grid)
-        with profile("sphere_tracer.compact_rays"):
-            n_rays_alive = self.backend.compact_rays()
-        logger.debug(f"Trace init - {n_rays_alive} "
+        
+        with profile("sphere_tracer.ray_march"):
+            valid_rays_idx, segs_pack_info, segs, debug_tensors = _backend.ray_march(
+                self.grid, *itemgetter("rays_o", "rays_d", "near", "far")(rays))
+        # >>> Debug ray_march
+        # segs_pack_info, segs, debug_tensors = _backend.ray_march(
+        #     self.grid, *itemgetter("rays_o", "rays_d", "near", "far")(rays), enable_debug=True)
+        # problem_rays_i = debug_tensors["flag"].nonzero(as_tuple=True)[0]
+        # problem_march_poses = debug_tensors["march_poses"][problem_rays_i]
+        # problem_march_voxels = debug_tensors["march_voxels"][problem_rays_i]
+        # problem_march_next_grids = debug_tensors["march_next_grids"][problem_rays_i]
+        # problem_march_txyzs = debug_tensors["march_txyzs"][problem_rays_i]
+        # if problem_rays_i.numel() > 0:
+        #     for i in range(1000):
+        #         print(problem_march_poses[0, i].tolist(), problem_march_voxels[0, i].tolist(),
+        #             problem_march_next_grids[0, i].tolist(), problem_march_txyzs[0, i].tolist())
+        # <<<
+        n_rays_alive = valid_rays_idx.numel()
+        logger.debug(f"Trace raymarch - {n_rays_alive} "
                      f"({n_rays_alive / n_rays * 100:.2f}%) rays alive")
+
+        with profile("sphere_tracer.init_rays"):
+            self.backend.init_rays(*itemgetter("rays_o", "rays_d")(rays), valid_rays_idx,
+                                   segs_pack_info, segs)
+        
         i = 0
-        distance_scale = self.distance_scale
-        while i < self.max_march_iters and \
-                (i < 100 and n_rays_alive > 0 or n_rays_alive > n_drop_alive):
+        while i < self.max_march_iters and n_rays_alive > n_drop_alive:
             compact_step_size = min(i + 1, self.max_steps_between_compact)
             for _ in range(compact_step_size):
                 with profile("sphere_tracer.query_sdf"):
                     with profile("sphere_tracer.get_trace_positions"):
                         pts = self.backend.get_trace_positions()
                     query_ret = sdf_query(pts)
-
-                if isinstance(query_ret, dict):
-                    raw_distances = query_ret["sdf"]
-                    nablas = query_ret.get("nablas")
-                else:
-                    raw_distances = query_ret
-                    nablas = None
-
-                if nablas is not None:
-                    # Mitigate sway by normalizing distance if gradient is available
-                    normal_norm = nablas.norm(dim=-1)
-                    fixed_distances = raw_distances / normal_norm.clip(1.0)
-                else:
-                    # Mitigate sway by decay distance scale
-                    normal_norm = None
-                    fixed_distances = raw_distances
-                    if i >= 100 and i % 10 == 0:
-                        distance_scale = max(distance_scale * 0.9, 0.1)
-
+                    distances = query_ret["sdf"] if isinstance(query_ret, dict) else query_ret
                 if debug_trace_data is not None:
                     debug_trace_data.append({
                         "x": pts.clone(),
-                        "d": fixed_distances,
-                        "raw_d": raw_distances,
-                        "nn": normal_norm,
+                        "d": distances,
                         "rays_alive": self.backend.get_rays(_backend.ALIVE),
                         "rays_hit": self.backend.get_rays(_backend.HIT)
                     })
                 with profile("sphere_tracer.advance_rays"):
-                    self.backend.advance_rays(fixed_distances.to(torch.float), self.zero_offset,
-                                              distance_scale, self.hit_threshold, self.hit_at_neg,
-                                              self.grid)
+                    self.backend.advance_rays(distances.to(torch.float), self.zero_offset,
+                                              self.distance_scale, self.min_step)
                 i += 1
 
             with profile("sphere_tracer.compact_rays"):
