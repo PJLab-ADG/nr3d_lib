@@ -11,6 +11,7 @@ import numpy as np
 from typing import Optional
 
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 rank = 0        # process id, for IPC
 local_rank = 0  # local GPU device id
@@ -33,11 +34,15 @@ def init_env(args, seed=42):
         print(msg)
         
         #------------- multi process running, using DDP
-        if 'SLURM_PROCID' in os.environ:
-            #--------- for SLURM
+        dist_launcher: str = args.get('dist_launcher', 'pytorch').lower()
+        if ('SLURM_PROCID' in os.environ) or dist_launcher == 'slurm':
+            #--------- For SLURM
             slurm_initialize('nccl', port=args.port)
+        elif dist_launcher == 'aliyun':
+            #--------- For Aliyun PAI
+            aliyun_pai_initialize(backend='nccl', port=args.port)
         else:
-            #--------- for torch.distributed.launch
+            #--------- For torch.distributed.launch
             dist.init_process_group(backend='nccl')
 
         rank = int(os.environ['RANK'])
@@ -99,6 +104,20 @@ def slurm_initialize(backend='nccl', port: Optional[int] = None):
     torch.cuda.set_device(device)
     os.environ['LOCAL_RANK'] = str(device)
 
+def aliyun_pai_initialize(backend='nccl', port: Optional[int] = None):
+    if mp.get_start_method(allow_none=True) is None:
+        mp.set_start_method('spawn')
+
+    if port is not None:
+        os.environ['MASTER_PORT'] = str(port)
+    elif 'MASTER_PORT' not in os.environ:
+        os.environ["MASTER_PORT"] = "13333"
+
+    dist.init_process_group(backend=backend)
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+    torch.cuda.set_device(device)
+    os.environ['LOCAL_RANK'] = str(device)
 
 def set_seed(seed):
     random.seed(seed)
