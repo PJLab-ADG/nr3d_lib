@@ -39,7 +39,16 @@ pip install opencv-python-headless kornia imagesize omegaconf addict imageio ima
 
 ### One-liner install
 
-`cd` to the `nr3d_lib` directory, and then: (Notice the trailing dot `.`)
+Clone with submodules:
+```shell
+git clone https://github.com/PJLab-ADG/nr3d_lib --recurse-submodules
+# or
+# git clone git@github.com:PJLab-ADG/nr3d_lib.git --recurse-submodules
+```
+
+`cd` to the `nr3d_lib` directory.
+
+Then: (Notice the trailing dot `.`)
 
 ```shell
 pip install -v .
