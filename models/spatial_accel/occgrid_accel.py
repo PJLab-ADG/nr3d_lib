@@ -157,11 +157,14 @@ class OccupancyGridAS(nn.Module):
         # NOTE: Primary drawing function
         # from vedo.applications import IsosurfaceBrowser
         occ_val_grid = self.occ.occ_val_grid.data.cpu().numpy()
-        spacing = ((self.space.aabb[1]-self.space.aabb[0]) / self.occ.resolution).tolist()
-        origin = self.space.aabb[0].tolist()
-        vol = Volume(occ_val_grid, c=['white','b','g','r'], mapper='gpu', origin=origin, spacing=spacing)
-        vox = vol.legosurface(vmin=self.occ.occ_thre, vmax=1., boundary=True)
-        vox.cmap('GnBu', on='cells', vmin=self.occ.occ_thre, vmax=1.).add_scalarbar()
+        if (occ_val_grid > self.occ.occ_thre).any():
+            spacing = ((self.space.aabb[1]-self.space.aabb[0]) / self.occ.resolution).tolist()
+            origin = self.space.aabb[0].tolist()
+            vol = Volume(occ_val_grid, c=['white','b','g','r'], mapper='gpu', origin=origin, spacing=spacing)
+            vox = vol.legosurface(vmin=self.occ.occ_thre, vmax=1., boundary=True)
+            vox.cmap('GnBu', on='cells', vmin=self.occ.occ_thre, vmax=1.).add_scalarbar()
+        else:
+            vox = None
         if draw:
             show(vox, __doc__, axes=1, viewup='z').close()
         else:
