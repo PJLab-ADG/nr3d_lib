@@ -21,56 +21,12 @@
 #include <torch/torch.h>
 // #include <THC/THCAtomics.cuh>
 
-#include "lotd.h"
+#include "lotd_cuda.h"
 #include "lotd_torch_api.h"
 #include "if_constexpr.hpp" // pre-c++17 constexpr if
 
 namespace lotd {
 namespace torch {
-
-static constexpr uint32_t MAX_N_LEVELS = 32;
-static constexpr uint32_t MAX_N_POS_DIMS = 4;
-
-struct LoDMetaRef {
-	uint32_t level_res[MAX_N_LEVELS][MAX_N_POS_DIMS] = {};
-	uint32_t level_n_feats[MAX_N_LEVELS];
-	LoDType level_types[MAX_N_LEVELS];
-	uint32_t level_n_params[MAX_N_LEVELS];
-	uint32_t level_sizes[MAX_N_LEVELS];
-	uint32_t level_offsets[MAX_N_LEVELS+1];
-
-	uint32_t map_levels[MAX_N_LEVELS * 8];
-	uint32_t map_cnt[MAX_N_LEVELS * 8];
-
-	uint32_t n_levels = 0;
-	uint32_t n_pseudo_levels = 0; 
-	uint32_t n_feat_per_pseudo_lvl = 0;
-	uint32_t n_dims_to_encode = 3;
-	uint32_t n_encoded_dims = 0;
-
-	InterpolationType interpolation_type = InterpolationType::Linear;
-
-	__host__ LoDMetaRef(const LoDMeta& meta): 
-		n_levels{meta.n_levels}, n_pseudo_levels{meta.n_pseudo_levels}, n_feat_per_pseudo_lvl{meta.n_feat_per_pseudo_lvl}, 
-		n_dims_to_encode{meta.n_dims_to_encode}, n_encoded_dims{meta.n_encoded_dims}, interpolation_type{meta.interpolation_type} {
-			for (uint32_t l=0; l<meta.n_levels; ++l) {
-				for (uint32_t dim=0; dim < meta.n_dims_to_encode; ++dim) {
-					level_res[l][dim] = meta.level_res_multi_dim[l][dim];
-				}
-				// level_res[l] = meta.level_res[l];
-				level_n_feats[l] = meta.level_n_feats[l];
-				level_types[l] = (LoDType)meta.level_types[l];
-				level_n_params[l] = meta.level_n_params[l];
-				level_sizes[l] = meta.level_sizes[l];
-				level_offsets[l] = meta.level_offsets[l];
-			}
-			level_offsets[meta.n_levels] = meta.level_offsets[meta.n_levels];
-			for (uint32_t psl=0; psl<meta.n_pseudo_levels; ++psl) {
-				map_levels[psl] = meta.map_levels[psl];
-				map_cnt[psl] = meta.map_cnt[psl];
-			}
-		};
-};
 
 template <typename INPUT_T, typename PARAM_T, typename COMPUTE_T, uint32_t N_POS_DIMS, uint32_t N_FEAT, typename F>
 __device__ __forceinline__ void fwd_n_linear(
@@ -93,29 +49,27 @@ __device__ __forceinline__ void fwd_n_linear(
 		return val;
 	};
 
-	if (result_ptr) {
-		#pragma unroll 1 // Force skip unrolling; significantly reduce kernel code size & actually increase speed;
-		for (uint32_t idx = 0; idx < (1 << N_POS_DIMS); ++idx) {
-			COMPUTE_T weight = 1;
-			uint32_t pos_grid_local[N_POS_DIMS];
+	#pragma unroll 1 // Force skip unrolling; significantly reduce kernel code size & actually increase speed;
+	for (uint32_t idx = 0; idx < (1 << N_POS_DIMS); ++idx) {
+		COMPUTE_T weight = 1;
+		uint32_t pos_grid_local[N_POS_DIMS];
 
-			#pragma unroll
-			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-				if ((idx & (1<<dim)) == 0) {
-					weight *= (COMPUTE_T)1 - (COMPUTE_T)pos[dim];
-					pos_grid_local[dim] = pos_grid[dim];
-				} else {
-					weight *= pos[dim];
-					pos_grid_local[dim] = pos_grid[dim] + 1;
-				}
+		#pragma unroll
+		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+			if ((idx & (1<<dim)) == 0) {
+				weight *= (COMPUTE_T)1 - (COMPUTE_T)pos[dim];
+				pos_grid_local[dim] = pos_grid[dim];
+			} else {
+				weight *= pos[dim];
+				pos_grid_local[dim] = pos_grid[dim] + 1;
 			}
+		}
 
-			auto val = grid_val(pos_grid_local);
+		auto val = grid_val(pos_grid_local);
 
-			#pragma unroll
-			for (uint32_t f = 0; f < N_FEAT; ++f) {
-				result_ptr[f] += (PARAM_T)(weight * (COMPUTE_T)((PARAM_T*)&val)[f]);
-			}
+		#pragma unroll
+		for (uint32_t f = 0; f < N_FEAT; ++f) {
+			result_ptr[f] += (PARAM_T)(weight * (COMPUTE_T)((PARAM_T*)&val)[f]);
 		}
 	}
 
@@ -159,21 +113,19 @@ __device__ __forceinline__ void fwd_n_linear(
 template <typename INPUT_T, typename PARAM_T, typename COMPUTE_T, uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL>
 __global__ void kernel_lod(
 	const uint32_t num_elements,
-	const uint32_t num_lod_features, 
-	const uint32_t num_levels, 
 	const LoDMetaRef lod_meta,
 	int32_t max_level,
-	const int32_t* __restrict__ max_level_gpu,   // [n_points]
+	const int32_t* __restrict__ max_level_gpu, // [n_points] Optional per-point max_level
 	// inputs
 	const PARAM_T* __restrict__ grid,          // [n_params]
-	const INPUT_T* __restrict__ positions_in,  // [n_points, 3]
+	const INPUT_T* __restrict__ positions,  // [n_points, N_POS_DIMS]
 	// Optional inputs for multi-batch data
 	const int64_t* __restrict__ batch_inds,    // [n_points]
 	const int64_t* __restrict__ batch_offsets, // [n_batch]
 	const uint32_t batch_data_size,
 	// outputs
-	PARAM_T* __restrict__ encoded_positions,
-	INPUT_T* __restrict__ dy_dx
+	PARAM_T* __restrict__ encoded,             // [n_points, n_encoded_dims]
+	INPUT_T* __restrict__ dy_dx                // [n_points, n_encoded_dims, N_POS_DIMS]
 ) {
 	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= num_elements) return;
@@ -188,11 +140,11 @@ __global__ void kernel_lod(
 	}
 
 	auto set_zero = [&] () {
-		if (encoded_positions) {
+		if (encoded) {
 			#pragma unroll
 			for (uint32_t f = 0; f < N_FEAT_PER_PSEUDO_LVL; ++f) {
-				// encoded_positions[i + (out_feat_offset + f) * num_elements] = (PARAM_T)0.0f;
-				encoded_positions[i * num_lod_features + out_feat_offset + f] = (PARAM_T)0.0f;
+				// encoded[i + (out_feat_offset + f) * num_elements] = (PARAM_T)0.0f;
+				encoded[i * lod_meta.n_encoded_dims + out_feat_offset + f] = (PARAM_T)0.0f;
 			}
 		}
 
@@ -201,7 +153,7 @@ __global__ void kernel_lod(
 			#pragma unroll
 			for (uint32_t f = 0; f < N_FEAT_PER_PSEUDO_LVL; ++f) {
 				// ((vector_t<INPUT_T, N_POS_DIMS>*)dy_dx)[i + (out_feat_offset + f) * num_elements] = {0};
-				((vector_t<INPUT_T, N_POS_DIMS>*)dy_dx)[i * num_lod_features + out_feat_offset + f] = {};
+				((vector_t<INPUT_T, N_POS_DIMS>*)dy_dx)[i * lod_meta.n_encoded_dims + out_feat_offset + f] = {};
 			}
 		}
 	};
@@ -211,7 +163,9 @@ __global__ void kernel_lod(
 		return;
 	}
 
-	// For batched
+	// For batched:
+	// 1. First calculate `batch_ind` of current point
+	// 2. Then offset `grid` to the caculated `batch_ind`
 	uint32_t batch_ind = 0;
 	if (batch_inds) {
 		// NOTE: pass in batch_ind=-1 to ignore certain points.
@@ -239,37 +193,38 @@ __global__ void kernel_lod(
 	COMPUTE_T pos_derivative[N_POS_DIMS];
 	uint32_t pos_grid[N_POS_DIMS];
 
-	positions_in += i * N_POS_DIMS;
+	positions += i * N_POS_DIMS;
 	if (dy_dx) {
-		pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions_in, scale, interpolation_type, pos_grid, pos, pos_derivative);
+		pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions, scale, interpolation_type, pos_grid, pos, pos_derivative);
 	} else {
-		pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions_in, scale, interpolation_type, pos_grid, pos);
+		pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions, scale, interpolation_type, pos_grid, pos);
 	}
 
-	// PARAM_T* result_ptr = encoded_positions ? (encoded_positions + i * num_lod_features + out_feat_offset) : nullptr;
+	// PARAM_T* result_ptr = encoded ? (encoded + i * lod_meta.n_encoded_dims + out_feat_offset) : nullptr;
 	vector_t<PARAM_T, N_FEAT_PER_PSEUDO_LVL> result = {};
-	PARAM_T* result_ptr = encoded_positions ? (PARAM_T*)&result : nullptr;
+	PARAM_T* result_ptr = encoded ? (PARAM_T*)&result : nullptr;
 
-	// vector_t<INPUT_T, N_POS_DIMS>* grads_ptr = dy_dx ? ( ((vector_t<INPUT_T, N_POS_DIMS>*)dy_dx) + i * num_lod_features + out_feat_offset ) : nullptr;
+	// vector_t<INPUT_T, N_POS_DIMS>* grads_ptr = dy_dx ? ( ((vector_t<INPUT_T, N_POS_DIMS>*)dy_dx) + i * lod_meta.n_encoded_dims + out_feat_offset ) : nullptr;
 	vector_t<INPUT_T, N_POS_DIMS> grads[N_FEAT_PER_PSEUDO_LVL] = {};
 	vector_t<INPUT_T, N_POS_DIMS>* grads_ptr = dy_dx ? grads : nullptr;
 	
-	void (*get_grid_val)(const uint32_t[N_POS_DIMS], const uint32_t, const uint32_t[N_POS_DIMS], const uint32_t, const uint32_t, const PARAM_T*, PARAM_T*);
-
+	//---- NOTE: Using switch-case is 2.5x faster than altering function pointers
 	switch (lod_type_cur_lvl)
 	{
 		case LoDType::Dense:
 		{
-			get_grid_val = grid_val_dense_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>;
-			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(get_grid_val, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
+			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(
+				grid_val_dense_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
 		}
 		break;
 
 		case LoDType::VectorMatrix:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				get_grid_val = grid_val_vm_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>;
-				fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(get_grid_val, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
+				fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(
+					grid_val_vm_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>, 
+					scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -278,8 +233,9 @@ __global__ void kernel_lod(
 		case LoDType::VecZMatXoY:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				get_grid_val = grid_val_vec_z_mat_xoy_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>;
-				fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(get_grid_val, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
+				fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(
+					grid_val_vec_z_mat_xoy_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>, 
+					scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -287,22 +243,25 @@ __global__ void kernel_lod(
 
 		case LoDType::NPlaneMul:
 		{
-			get_grid_val = grid_val_nplane_mul_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>;
-			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(get_grid_val, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
+			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(
+				grid_val_nplane_mul_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
 		}
 		break;
 
 		case LoDType::CP:
 		{
-			get_grid_val = grid_val_cp_eq_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>;
-			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(get_grid_val, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
+			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(
+				grid_val_cp_eq_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
 		}
 		break;
 
 		case LoDType::Hash:
 		{
-			get_grid_val = grid_val_hash_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>;
-			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(get_grid_val, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
+			fwd_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(
+				grid_val_hash_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, result_ptr, grads_ptr);
 		}
 		break;
 
@@ -315,7 +274,7 @@ __global__ void kernel_lod(
 					return *(vector_t<PARAM_T, N_FEAT_PER_PSEUDO_LVL>*)&grid[index];
 				};
 
-				if (encoded_positions) {
+				if (encoded) {
 					COMPUTE_T wplane = 1; // Or, set to 1.0f / N_POS_DIMS
 					#pragma unroll 1 // Force skip unrolling; significantly reduce kernel code size & actually increase speed;
 					for (uint32_t jump_dim=0; jump_dim < N_POS_DIMS; ++jump_dim) {
@@ -398,7 +357,7 @@ __global__ void kernel_lod(
 				return *(vector_t<PARAM_T, N_FEAT_PER_PSEUDO_LVL>*)&grid[index];
 			};
 
-			if (encoded_positions) {
+			if (encoded) {
 				vector_t<COMPUTE_T, N_FEAT_PER_PSEUDO_LVL> result_;
 				#pragma unroll
 				for (uint32_t f=0; f < N_FEAT_PER_PSEUDO_LVL; ++f) ((COMPUTE_T*)&result_)[f] = (COMPUTE_T)1.0f;
@@ -451,16 +410,16 @@ __global__ void kernel_lod(
 		break;
 	}
 
-	if (encoded_positions) {
-		encoded_positions += i * num_lod_features + out_feat_offset;
+	if (encoded) {
+		encoded += i * lod_meta.n_encoded_dims + out_feat_offset;
 		#pragma unroll
 		for (uint32_t f=0; f<N_FEAT_PER_PSEUDO_LVL; ++f) {
-			encoded_positions[f] = ((PARAM_T*)&result)[f];
+			encoded[f] = ((PARAM_T*)&result)[f];
 		}
 	}
 
 	if (dy_dx) {
-		dy_dx += N_POS_DIMS * (i * num_lod_features + out_feat_offset);
+		dy_dx += N_POS_DIMS * (i * lod_meta.n_encoded_dims + out_feat_offset);
 		#pragma unroll
 		for (uint32_t f=0; f<N_FEAT_PER_PSEUDO_LVL; ++f) {
 			((vector_t<INPUT_T, N_POS_DIMS>*)dy_dx)[f] = grads[f];
@@ -506,17 +465,15 @@ __device__ __forceinline__ void bwd_n_linear(
 }
 
 template <typename INPUT_T, typename PARAM_T, typename GRAD_T, typename COMPUTE_T, uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL, uint32_t N_FEAT_PER_THREAD>
-__global__ void kernel_lod_backward(
+__global__ void kernel_lod_backward_grid(
 	const uint32_t num_elements,
-	const uint32_t num_lod_features, 
-	const uint32_t num_levels, 
 	const LoDMetaRef lod_meta,
 	int32_t max_level,
 	const int32_t* __restrict__ max_level_gpu,
 	// inputs
 	const PARAM_T* __restrict__ dL_dy,
 	const PARAM_T* __restrict__ grid,
-	const INPUT_T* __restrict__ positions_in,
+	const INPUT_T* __restrict__ positions,
 	// Optional inputs for multi-batch data
 	const int64_t* __restrict__ batch_inds,
 	const int64_t* __restrict__ batch_offsets,
@@ -569,10 +526,10 @@ __global__ void kernel_lod_backward(
 	COMPUTE_T pos[N_POS_DIMS];
 	uint32_t pos_grid[N_POS_DIMS];
 
-	positions_in += i * N_POS_DIMS;
-	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions_in, scale, interpolation_type, pos_grid, pos);
+	positions += i * N_POS_DIMS;
+	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions, scale, interpolation_type, pos_grid, pos);
 
-	dL_dy += i * num_lod_features + out_feat_offset;
+	dL_dy += i * lod_meta.n_encoded_dims + out_feat_offset;
 	vector_t<PARAM_T, N_FEAT_PER_THREAD> grad;
 	#pragma unroll
 	for (uint32_t f = 0; f < N_FEAT_PER_THREAD; ++f) {
@@ -580,27 +537,31 @@ __global__ void kernel_lod_backward(
 		grad[f] = dL_dy[f];
 	}
 
+	//---- NOTE: Using switch-case is 2.5x faster than altering function pointers
 	switch (lod_type_cur_lvl)
 	{
 		case LoDType::Dense:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_dense_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
+			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_dense_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
 		}
 		break;
 
 		case LoDType::NPlaneMul:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_nplane_mul_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
+			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_nplane_mul_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
 		}
 		break;
 
 		case LoDType::VectorMatrix:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				auto add_grid_grad_impl = add_grid_gridient_vm_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-				bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
+				bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+					add_grid_gridient_vm_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+					pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -609,8 +570,9 @@ __global__ void kernel_lod_backward(
 		case LoDType::VecZMatXoY:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				auto add_grid_grad_impl = add_grid_gridient_vec_z_mat_xoy_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-				bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
+				bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+					add_grid_gridient_vec_z_mat_xoy_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+					pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -618,15 +580,17 @@ __global__ void kernel_lod_backward(
 
 		case LoDType::CP:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_cp_eq_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
+			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_cp_eq_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
 		}
 		break;
 
 		case LoDType::Hash:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_hash_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
+			bwd_n_linear<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_hash_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				pos, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grid_gradient);
 		}
 		break;
 
@@ -800,8 +764,6 @@ __device__ __forceinline__ void bwd_input_bwd_grid_n_linear(
 template <typename INPUT_T, typename PARAM_T, typename GRAD_T, typename COMPUTE_T, uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL, uint32_t N_FEAT_PER_THREAD>
 __global__ void kernel_lod_backward_input_backward_grid(
 	const uint32_t num_elements,
-	const uint32_t num_lod_features, 
-	const uint32_t num_levels, 
 	const LoDMetaRef lod_meta,
 	int32_t max_level,
 	const int32_t* __restrict__ max_level_gpu,
@@ -809,7 +771,7 @@ __global__ void kernel_lod_backward_input_backward_grid(
 	const INPUT_T* __restrict__ dL_ddLdx,
 	const PARAM_T* __restrict__ dL_dy,
 	const PARAM_T* __restrict__ grid,
-	const INPUT_T* __restrict__ positions_in,
+	const INPUT_T* __restrict__ positions,
 	// Optional inputs for multi-batch data
 	const int64_t* __restrict__ batch_inds,
 	const int64_t* __restrict__ batch_offsets,
@@ -863,10 +825,10 @@ __global__ void kernel_lod_backward_input_backward_grid(
 	COMPUTE_T pos_derivative[N_POS_DIMS];
 	uint32_t pos_grid[N_POS_DIMS];
 
-	positions_in += i * N_POS_DIMS;
-	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions_in, scale, interpolation_type, pos_grid, pos, pos_derivative);
+	positions += i * N_POS_DIMS;
+	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions, scale, interpolation_type, pos_grid, pos, pos_derivative);
 
-	dL_dy += i * num_lod_features + out_feat_offset;
+	dL_dy += i * lod_meta.n_encoded_dims + out_feat_offset;
 	vector_t<PARAM_T, N_FEAT_PER_THREAD> grad;
 	#pragma unroll
 	for (uint32_t f = 0; f < N_FEAT_PER_THREAD; ++f) {
@@ -881,27 +843,31 @@ __global__ void kernel_lod_backward_input_backward_grid(
 		grad_input[dim] = dL_ddLdx[dim];
 	}
 
+	//---- NOTE: Using switch-case is 2.5x faster than altering function pointers
 	switch (lod_type_cur_lvl)
 	{
 		case LoDType::Dense:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_dense_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
+			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_dense_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
 		}
 		break;
 
 		case LoDType::NPlaneMul:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_nplane_mul_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
+			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_nplane_mul_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
 		}
 		break;
 
 		case LoDType::VectorMatrix:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				auto add_grid_grad_impl = add_grid_gridient_vm_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-				bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
+				bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+					add_grid_gridient_vm_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+					scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -910,8 +876,9 @@ __global__ void kernel_lod_backward_input_backward_grid(
 		case LoDType::VecZMatXoY:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				auto add_grid_grad_impl = add_grid_gridient_vec_z_mat_xoy_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-				bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
+				bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+					add_grid_gridient_vec_z_mat_xoy_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+					scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -919,15 +886,17 @@ __global__ void kernel_lod_backward_input_backward_grid(
 
 		case LoDType::CP:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_cp_eq_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
+			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_cp_eq_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
 		}
 		break;
 
 		case LoDType::Hash:
 		{
-			auto add_grid_grad_impl = add_grid_gridient_hash_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>;
-			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(add_grid_grad_impl, scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
+			bwd_input_bwd_grid_n_linear<INPUT_T, PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				add_grid_gridient_hash_impl<PARAM_T, GRAD_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD, std::is_same<GRAD_T, __half>::value>, 
+				scale, pos, pos_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, grid_gradient);
 		}
 		break;
 
@@ -1191,8 +1160,6 @@ __global__
 typename std::enable_if<std::is_same<INPUT_T, float>::value, void>::type
 kernel_lod_backward_input_backward_input(
 	const uint32_t num_elements,
-	const uint32_t num_lod_features, 
-	const uint32_t num_levels, 
 	const LoDMetaRef lod_meta,
 	int32_t max_level,
 	const int32_t* __restrict__ max_level_gpu,
@@ -1200,7 +1167,7 @@ kernel_lod_backward_input_backward_input(
 	const INPUT_T* __restrict__ dL_ddLdx,
 	const PARAM_T* __restrict__ dL_dy,
 	const PARAM_T* __restrict__ grid,
-	const INPUT_T* __restrict__ positions_in,
+	const INPUT_T* __restrict__ positions,
 	// Optional inputs for multi-batch data
 	const int64_t* __restrict__ batch_inds,
 	const int64_t* __restrict__ batch_offsets,
@@ -1254,10 +1221,10 @@ kernel_lod_backward_input_backward_input(
 	COMPUTE_T pos_2nd_derivative[N_POS_DIMS];
 	uint32_t pos_grid[N_POS_DIMS];
 
-	positions_in += i * N_POS_DIMS;
-	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions_in, scale, interpolation_type, pos_grid, pos, pos_derivative, pos_2nd_derivative);
+	positions += i * N_POS_DIMS;
+	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions, scale, interpolation_type, pos_grid, pos, pos_derivative, pos_2nd_derivative);
 
-	dL_dy += i * num_lod_features + out_feat_offset;
+	dL_dy += i * lod_meta.n_encoded_dims + out_feat_offset;
 	vector_t<PARAM_T, N_FEAT_PER_THREAD> grad;
 	#pragma unroll
 	for (uint32_t f = 0; f < N_FEAT_PER_THREAD; ++f) {
@@ -1274,20 +1241,23 @@ kernel_lod_backward_input_backward_input(
 
 	vector_t<INPUT_T, N_POS_DIMS> grad_result = {};
 
+	//---- NOTE: Using switch-case is 2.5x faster than altering function pointers
 	switch (lod_type_cur_lvl)
 	{
 		case LoDType::Dense:
 		{
-			auto calc_dLdx_dim_impl = calc_dLdx_dim_dense_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>;
-			bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(calc_dLdx_dim_impl, scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
+			bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				calc_dLdx_dim_dense_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>, 
+				scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
 		}
 		break;
 
 		case LoDType::VectorMatrix:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				auto calc_dLdx_dim_impl = calc_dLdx_dim_vm_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>;
-				bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(calc_dLdx_dim_impl, scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
+				bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+					calc_dLdx_dim_vm_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>, 
+					scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -1296,8 +1266,9 @@ kernel_lod_backward_input_backward_input(
 		case LoDType::VecZMatXoY:
 		{
 			ic::if_<N_POS_DIMS==3>([&]{
-				auto calc_dLdx_dim_impl = calc_dLdx_dim_vec_z_mat_xoy_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>;
-				bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(calc_dLdx_dim_impl, scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
+				bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+					calc_dLdx_dim_vec_z_mat_xoy_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>, 
+					scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
 			}, []{});
 			// if constexpr (N_POS_DIMS==3) // NOTE: Valid after c++17 (CUDA>=11)
 		}
@@ -1305,8 +1276,9 @@ kernel_lod_backward_input_backward_input(
 
 		case LoDType::Hash:
 		{
-			auto calc_dLdx_dim_impl = calc_dLdx_dim_hash_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>;
-			bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(calc_dLdx_dim_impl, scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
+			bwd_input_bwd_input_n_linear<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>(
+				calc_dLdx_dim_hash_impl<PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_THREAD>, 
+				scale, interpolation_type, pos, pos_derivative, pos_2nd_derivative, pos_grid, grid_feat_offset, grid_resolution, grid_size, n_feat_cur_lvl, grid, grad, grad_input, (INPUT_T*)&grad_result);
 		}
 		break;
 	}
@@ -1328,19 +1300,17 @@ kernel_lod_backward_input_backward_input(
 template <typename INPUT_T, typename COMPUTE_T, uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL>
 __global__ void kernel_lod_get_grid_index(
 	const uint32_t num_elements,
-	const uint32_t num_lod_features, 
-	const uint32_t num_levels, 
 	const LoDMetaRef lod_meta,
 	int32_t max_level,
 	const int32_t* __restrict__ max_level_gpu,   // [n_points]
 	// inputs
-	const INPUT_T* __restrict__ positions_in,  // [n_points, 3]
+	const INPUT_T* __restrict__ positions,  // [n_points, 3]
 	// Optional inputs for multi-batch data
 	const int64_t* __restrict__ batch_inds,    // [n_points]
 	const int64_t* __restrict__ batch_offsets, // [n_batch]
 	const uint32_t batch_data_size,
 	// outputs
-	int64_t* __restrict__ grid_inds // [n_points, num_lod_features, 2^N_POS_DIMS]
+	int64_t* __restrict__ grid_inds // [n_points, lod_meta.n_encoded_dims, 2^N_POS_DIMS]
 ) {
 	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= num_elements) return;
@@ -1385,10 +1355,10 @@ __global__ void kernel_lod_get_grid_index(
 	COMPUTE_T pos[N_POS_DIMS];
 	uint32_t pos_grid[N_POS_DIMS];
 
-	positions_in += i * N_POS_DIMS;
-	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions_in, scale, interpolation_type, pos_grid, pos);
+	positions += i * N_POS_DIMS;
+	pos_fract<N_POS_DIMS, INPUT_T, COMPUTE_T>(positions, scale, interpolation_type, pos_grid, pos);
 
-	grid_inds += (i * num_lod_features + out_feat_offset) * (1<<N_POS_DIMS);
+	grid_inds += (i * lod_meta.n_encoded_dims + out_feat_offset) * (1<<N_POS_DIMS);
 
 	switch (lod_type_cur_lvl)
 	{
@@ -1477,17 +1447,20 @@ inline void lod_fwd_impl_dispatched(
 ) {
 	const uint32_t batch_size = input.size(0);
 
-	static constexpr uint32_t n_threads = 512;
-	// static constexpr uint32_t n_threads = 128;
-	const dim3 blocks_lod = { div_round_up(batch_size, n_threads), lod_meta.n_pseudo_levels, 1 };
+	const dim3 blocks_lod = { div_round_up(batch_size, N_THREADS), lod_meta.n_pseudo_levels, 1 };
 
 	const at::cuda::OptionalCUDAGuard device_guard(at::device_of(params));
 	cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-	kernel_lod<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL><<<blocks_lod, n_threads, 0, stream>>>(
+	cudaEvent_t start, stop;
+	if (lod_meta.c_profile) {
+		cudaEventCreate(&start);
+		cudaEventCreate(&stop);
+		cudaEventRecord(start, stream);
+	}
+
+	kernel_lod<INPUT_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL><<<blocks_lod, N_THREADS, 0, stream>>>(
 		batch_size, 
-		lod_meta.n_encoded_dims, 
-		lod_meta.n_levels, 
 		{lod_meta}, 
 		max_level, (int32_t*)nullptr, 
 		data_ptr<PARAM_T>(params), 
@@ -1498,6 +1471,18 @@ inline void lod_fwd_impl_dispatched(
 		data_ptr<PARAM_T>(output),
 		need_input_grad ? data_ptr<INPUT_T>(dy_dx) : nullptr
 	);
+	
+	if (lod_meta.c_profile) {
+		cudaEventRecord(stop, stream);
+		cudaEventSynchronize(stop);
+		float milliseconds = 0;
+		cudaEventElapsedTime(&milliseconds, start, stop);
+		std::cout << "Generic-LOD" << input.size(1) << (need_input_grad ? "-grad" : "") << ", "
+		          << input.size(0) << ", " << milliseconds << ", "
+				  << milliseconds / input.size(0) * 1000000.0f << std::endl;
+		cudaEventDestroy(start);
+		cudaEventDestroy(stop);
+	}
 }
 
 template <uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL>
@@ -1513,15 +1498,14 @@ inline void lod_fwd_impl_templated(
 	at::Tensor output, 
 	at::Tensor dy_dx
 ) {
-	if (input.scalar_type() == at::kHalf && params.scalar_type() == at::kHalf) {
-		lod_fwd_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx);
-	} else if (input.scalar_type() == at::kFloat && params.scalar_type() == at::kHalf) {
-		lod_fwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx);
-	} else if (input.scalar_type() == at::kFloat && params.scalar_type() == at::kFloat) {
-		lod_fwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx);
-	} else {
+	auto fn = (input.scalar_type() == at::kHalf && params.scalar_type() == at::kHalf) ? lod_fwd_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL> 
+			: (input.scalar_type() == at::kFloat && params.scalar_type() == at::kHalf) ? lod_fwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: (input.scalar_type() == at::kFloat && params.scalar_type() == at::kFloat) ? lod_fwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: nullptr; 
+	if (!fn) {
 		throw std::runtime_error("LoTDEncoding: Input type combination not supported. Supported types are: <input,param> -> (half, half), (float, half), (float, float)");
 	}
+	fn(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx);
 }
 
 template <uint32_t N_POS_DIMS>
@@ -1537,12 +1521,14 @@ void lod_fwd_impl(
 	at::Tensor output, 
 	at::Tensor dy_dx
 ) {
-	switch (lod_meta.n_feat_per_pseudo_lvl) {
-		case 2: lod_fwd_impl_templated<N_POS_DIMS, 2>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
-		case 4: lod_fwd_impl_templated<N_POS_DIMS, 4>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
-		case 8: lod_fwd_impl_templated<N_POS_DIMS, 8>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
-		default: throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]"); break;
+	auto fn = (lod_meta.n_feat_per_pseudo_lvl == 2) ? lod_fwd_impl_templated<N_POS_DIMS, 2>
+			: (lod_meta.n_feat_per_pseudo_lvl == 4) ? lod_fwd_impl_templated<N_POS_DIMS, 4>
+			: (lod_meta.n_feat_per_pseudo_lvl == 8) ? lod_fwd_impl_templated<N_POS_DIMS, 8>
+			: nullptr; 
+	if (!fn) {
+		throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]");
 	}
+	fn(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); 
 }
 
 template <typename INPUT_T, typename PARAM_T, typename COMPUTE_T,  uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL>
@@ -1563,27 +1549,48 @@ inline void lod_bwd_impl_dispatched(
 ) {
 	const uint32_t batch_size = input.size(0);
 
+    const at::cuda::OptionalCUDAGuard device_guard(at::device_of(params));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaEvent_t start, stop;
+
+    if (lod_meta.c_profile) {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start, stream);
+    }
+
 	if (need_input_grad) {
 		// dL_dy, dy_dx -> dL_dx
-		// ([batch_size, n_encoded_dims, 1] * [batch_size, n_encoded_dims * n_dims_to_encode]).sum(-2) -> [batch_size, n_encoded_dims]
+		// [batch_size, n_encoded_dims], [batch_size, n_encoded_dims, n_dims_to_encode]
+		// -> [batch_size, n_encoded_dims]
 
-		dL_dx.unsqueeze_(-2);
-		at::bmm_out(dL_dx, dL_dy.view({batch_size, 1, lod_meta.n_encoded_dims}).to(scalar_type<INPUT_T>()), dy_dx_.value().view({batch_size, lod_meta.n_encoded_dims, lod_meta.n_dims_to_encode}));
-		dL_dx.squeeze_(-2);
+		auto dy_dx = dy_dx_.value().view({batch_size, lod_meta.n_encoded_dims, lod_meta.n_dims_to_encode});
+		auto dL_dy_1 = dL_dy.to(scalar_type<INPUT_T>());
+		
+		if (lod_meta.c_bmm_backend == 0) {
+			dL_dy_1 = dL_dy_1.unsqueeze(-2);
+			dL_dx.unsqueeze_(-2);
+			at::bmm_out(dL_dx, dL_dy_1, dy_dx);
+			dL_dx.squeeze_(-2);
+		} else if (lod_meta.c_bmm_backend == 1) {
+			// Fastest
+			dL_dy_1 = dL_dy_1.unsqueeze(-1);
+			at::sum_out(dL_dx, at::mul(dL_dy_1, dy_dx), -2);
+		} else if (lod_meta.c_bmm_backend == 2) {
+			dL_dx = at::einsum("ij,ijk->ik", {dL_dy_1, dy_dx});
+		}
+
+		// dL_dx.unsqueeze_(-2);
+		// at::bmm_out(dL_dx, dL_dy.view({batch_size, 1, lod_meta.n_encoded_dims}).to(scalar_type<INPUT_T>()), dy_dx_.value().view({batch_size, lod_meta.n_encoded_dims, lod_meta.n_dims_to_encode}));
+		// dL_dx.squeeze_(-2);
 	}
 
 	if (need_param_grad) {
-		static constexpr uint32_t N_THREADS_LOD = 256;
 		static constexpr uint32_t N_FEAT_PER_THREAD = std::min(2u, N_FEAT_PER_PSEUDO_LVL);
-		const dim3 blocks_lod = { div_round_up(batch_size * N_FEAT_PER_PSEUDO_LVL / N_FEAT_PER_THREAD, N_THREADS_LOD), lod_meta.n_pseudo_levels, 1 };
+		const dim3 blocks_lod = { div_round_up(batch_size * N_FEAT_PER_PSEUDO_LVL / N_FEAT_PER_THREAD, N_THREADS_BACK), lod_meta.n_pseudo_levels, 1 };
 
-		const at::cuda::OptionalCUDAGuard device_guard(at::device_of(params));
-		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-		kernel_lod_backward<INPUT_T, PARAM_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL, N_FEAT_PER_THREAD><<<blocks_lod, N_THREADS_LOD, 0, stream>>> (
+		kernel_lod_backward_grid<INPUT_T, PARAM_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL, N_FEAT_PER_THREAD><<<blocks_lod, N_THREADS_BACK, 0, stream>>> (
 			batch_size, 
-			lod_meta.n_encoded_dims, 
-			lod_meta.n_levels, 
 			{lod_meta}, 
 			max_level, (int32_t*)nullptr,
 			data_ptr<PARAM_T>(dL_dy), 
@@ -1595,6 +1602,19 @@ inline void lod_bwd_impl_dispatched(
 			data_ptr<PARAM_T>(dL_dparam)
 		);
 	}
+
+    if (lod_meta.c_profile) {
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        float milliseconds = 0;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        std::cout << "Generic-LOD" << input.size(1) << "-bwd-"
+                  << (need_input_grad ? "dx" : "") << (need_param_grad ? "dp" : "") << ", "
+                  << input.size(0) << ", " << milliseconds << ", " 
+				  << milliseconds / input.size(0) * 1000000.0f << std::endl;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
 }
 
 template <uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL>
@@ -1613,15 +1633,14 @@ inline void lod_bwd_impl_templated(
 	at::Tensor dL_dx,
 	at::Tensor dL_dparam
 ) {
-	if (input.scalar_type() == at::kHalf && params.scalar_type() == at::kHalf) {
-		lod_bwd_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); 
-	} else if (input.scalar_type() == at::kFloat && params.scalar_type() == at::kHalf) {
-		lod_bwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); 
-	} else if (input.scalar_type() == at::kFloat && params.scalar_type() == at::kFloat) {
-		lod_bwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); 
-	} else {
+	auto fn = (input.scalar_type() == at::kHalf && params.scalar_type() == at::kHalf) ? lod_bwd_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: (input.scalar_type() == at::kFloat && params.scalar_type() == at::kHalf) ? lod_bwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: (input.scalar_type() == at::kFloat && params.scalar_type() == at::kFloat) ? lod_bwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: nullptr; 
+	if (!fn) {
 		throw std::runtime_error("LoTDEncoding: Input type combination not supported. Supported types are: <input,param> -> (half, half), (float, half), (float, float)");
 	}
+	fn(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); 
 }
 
 template <uint32_t N_POS_DIMS>
@@ -1640,12 +1659,14 @@ void lod_bwd_impl(
 	at::Tensor dL_dx,
 	at::Tensor dL_dparam
 ) {
-	switch (lod_meta.n_feat_per_pseudo_lvl) {
-		case 2: lod_bwd_impl_templated<N_POS_DIMS, 2>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
-		case 4: lod_bwd_impl_templated<N_POS_DIMS, 4>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
-		case 8: lod_bwd_impl_templated<N_POS_DIMS, 8>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
-		default: throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]"); break;
+	auto fn = (lod_meta.n_feat_per_pseudo_lvl == 2) ? lod_bwd_impl_templated<N_POS_DIMS, 2>
+			: (lod_meta.n_feat_per_pseudo_lvl == 4) ? lod_bwd_impl_templated<N_POS_DIMS, 4>
+			: (lod_meta.n_feat_per_pseudo_lvl == 8) ? lod_bwd_impl_templated<N_POS_DIMS, 8>
+			: nullptr; 
+	if(!fn) {
+		throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]");
 	}
+	fn(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); 
 }
 
 template <typename INPUT_T, typename PARAM_T, typename COMPUTE_T, uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL>
@@ -1669,28 +1690,49 @@ inline void lod_bwd_bwd_input_impl_dispatched(
 ) {
 	const uint32_t batch_size = input.size(0);
 
+    const at::cuda::OptionalCUDAGuard device_guard(at::device_of(params));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaEvent_t start, stop;
+
+    if (lod_meta.c_profile) {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start, stream);
+    }
+
 	if (need_dLdy_grad) {
 		// dL_ddLdx, dy_dx -> dL_ddLdy
-		// [batch_size, n_dims_to_encode], [batch_size, n_encoded_dims, n_dims_to_encode] -> [batch_size, n_encoded_dims]
+		// [batch_size, n_dims_to_encode], [batch_size, n_encoded_dims, n_dims_to_encode]
+		// -> [batch_size, n_encoded_dims]
 
-		dL_ddLdy.unsqueeze_(-1);
-		at::bmm_out(dL_ddLdy, dy_dx_.value().view({ batch_size, lod_meta.n_encoded_dims, lod_meta.n_dims_to_encode }).to(scalar_type<PARAM_T>()), dL_ddLdx.view({ batch_size, lod_meta.n_dims_to_encode, 1 }).to(scalar_type<PARAM_T>()) );
-		dL_ddLdy.squeeze_(-1);
+		auto dy_dx = dy_dx_.value().view({batch_size, lod_meta.n_encoded_dims, lod_meta.n_dims_to_encode}).to(scalar_type<PARAM_T>());
+		auto dL_ddLdx_1 = dL_ddLdx.to(scalar_type<PARAM_T>()); 
+
+		if (lod_meta.c_bmm_backend == 0) {
+			dL_ddLdx_1 = dL_ddLdx_1.unsqueeze(-1);
+			dL_ddLdy.unsqueeze_(-1);
+			at::bmm_out(dL_ddLdy, dy_dx, dL_ddLdx_1);
+			dL_ddLdy.squeeze_(-1);
+		} else if (lod_meta.c_bmm_backend == 1) {
+			// Fastest
+			dL_ddLdx_1 = dL_ddLdx_1.unsqueeze(-2);
+			at::sum_out(dL_ddLdy, at::mul(dL_ddLdx_1, dy_dx), -1);
+		} else if (lod_meta.c_bmm_backend == 2) {
+			dL_ddLdy = at::einsum("ik,ijk->ij", {dL_ddLdx_1, dy_dx});
+		}
+
+		// dL_ddLdy.unsqueeze_(-1);
+		// at::bmm_out(dL_ddLdy, dy_dx_.value().view({ batch_size, lod_meta.n_encoded_dims, lod_meta.n_dims_to_encode }).to(scalar_type<PARAM_T>()), dL_ddLdx.view({ batch_size, lod_meta.n_dims_to_encode, 1 }).to(scalar_type<PARAM_T>()) );
+		// dL_ddLdy.squeeze_(-1);
 	}
 
 	if (need_input_grad) {
-		static constexpr uint32_t N_THREADS_LOD = 256;
 		static constexpr uint32_t N_FEAT_PER_THREAD = std::min(2u, N_FEAT_PER_PSEUDO_LVL);
-		const dim3 blocks_lod = { div_round_up(batch_size * N_FEAT_PER_PSEUDO_LVL / N_FEAT_PER_THREAD, N_THREADS_LOD), lod_meta.n_pseudo_levels, 1 };
-
-		const at::cuda::OptionalCUDAGuard device_guard(at::device_of(params));
-		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+		const dim3 blocks_lod = { div_round_up(batch_size * N_FEAT_PER_PSEUDO_LVL / N_FEAT_PER_THREAD, N_THREADS_BACK), lod_meta.n_pseudo_levels, 1 };
 
 		// Safer to use COMPUTE_T=float
-		kernel_lod_backward_input_backward_input<INPUT_T, PARAM_T, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL, N_FEAT_PER_THREAD><<<blocks_lod, N_THREADS_LOD, 0, stream>>>(
+		kernel_lod_backward_input_backward_input<INPUT_T, PARAM_T, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL, N_FEAT_PER_THREAD><<<blocks_lod, N_THREADS_BACK, 0, stream>>>(
 			batch_size, 
-			lod_meta.n_encoded_dims, 
-			lod_meta.n_levels, 
 			{lod_meta}, 
 			max_level, (int32_t*)nullptr, 
 			data_ptr<INPUT_T>(dL_ddLdx), 
@@ -1705,17 +1747,14 @@ inline void lod_bwd_bwd_input_impl_dispatched(
 	}
 
 	if (need_param_grad) {
-		static constexpr uint32_t N_THREADS_LOD = 256;
 		static constexpr uint32_t N_FEAT_PER_THREAD = std::min(2u, N_FEAT_PER_PSEUDO_LVL);
-		const dim3 blocks_lod = { div_round_up(batch_size * N_FEAT_PER_PSEUDO_LVL / N_FEAT_PER_THREAD, N_THREADS_LOD), lod_meta.n_pseudo_levels, 1 };
+		const dim3 blocks_lod = { div_round_up(batch_size * N_FEAT_PER_PSEUDO_LVL / N_FEAT_PER_THREAD, N_THREADS_BACK), lod_meta.n_pseudo_levels, 1 };
 
 		const at::cuda::OptionalCUDAGuard device_guard(at::device_of(params));
 		cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-		kernel_lod_backward_input_backward_grid<INPUT_T, PARAM_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL, N_FEAT_PER_THREAD><<<blocks_lod, N_THREADS_LOD, 0, stream>>>(
+		kernel_lod_backward_input_backward_grid<INPUT_T, PARAM_T, PARAM_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL, N_FEAT_PER_THREAD><<<blocks_lod, N_THREADS_BACK, 0, stream>>>(
 			batch_size, 
-			lod_meta.n_encoded_dims, 
-			lod_meta.n_levels, 
 			{lod_meta}, 
 			max_level, (int32_t*)nullptr, 
 			data_ptr<INPUT_T>(dL_ddLdx), 
@@ -1728,6 +1767,19 @@ inline void lod_bwd_bwd_input_impl_dispatched(
 			data_ptr<PARAM_T>(dL_dparams)
 		);
 	}
+
+    if (lod_meta.c_profile) {
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        float milliseconds = 0;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        std::cout << "Generic-LOD" << input.size(1) << "-bwd2-"
+                  << (need_input_grad ? "dx" : "") << (need_param_grad ? "dp" : "")
+                  << (need_dLdy_grad ? "dLdy" : "") << ", " << input.size(0) << ", " << milliseconds
+                  << ", " << milliseconds / input.size(0) * 1000000.0f << std::endl;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
 }
 
 
@@ -1750,16 +1802,13 @@ inline void lod_bwd_bwd_input_impl_templated(
 	at::Tensor dL_dx, 
 	at::Tensor dL_dparams
 ) {
-	if (input.scalar_type() == at::kHalf && params.scalar_type() == at::kHalf) {
-		throw std::runtime_error("LoTDEncoding: Currently do not support input type combination = (half,half)");
-		// lod_bwd_bwd_input_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); 
-	} else if (input.scalar_type() == at::kFloat && params.scalar_type() == at::kHalf) {
-		lod_bwd_bwd_input_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); 
-	} else if (input.scalar_type() == at::kFloat && params.scalar_type() == at::kFloat) {
-		lod_bwd_bwd_input_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); 
-	} else {
+	auto fn = (input.scalar_type() == at::kFloat && params.scalar_type() == at::kHalf) ? lod_bwd_bwd_input_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: (input.scalar_type() == at::kFloat && params.scalar_type() == at::kFloat) ? lod_bwd_bwd_input_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: nullptr; 
+	if(!fn) {
 		throw std::runtime_error("LoTDEncoding: Input type combination not supported. Supported types are: <input,param> -> (half, half), (float, half), (float, float)");
 	}
+	fn(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); 
 }
 
 template <uint32_t N_POS_DIMS>
@@ -1781,12 +1830,14 @@ void lod_bwd_bwd_input_impl(
 	at::Tensor dL_dx, 
 	at::Tensor dL_dparams
 ) {
-	switch (lod_meta.n_feat_per_pseudo_lvl) {
-		case 2: lod_bwd_bwd_input_impl_templated<N_POS_DIMS, 2>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
-		case 4: lod_bwd_bwd_input_impl_templated<N_POS_DIMS, 4>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
-		case 8: lod_bwd_bwd_input_impl_templated<N_POS_DIMS, 8>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
-		default: throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]"); break;
+	auto fn = (lod_meta.n_feat_per_pseudo_lvl == 2) ? lod_bwd_bwd_input_impl_templated<N_POS_DIMS, 2>
+			: (lod_meta.n_feat_per_pseudo_lvl == 4) ? lod_bwd_bwd_input_impl_templated<N_POS_DIMS, 4>
+			: (lod_meta.n_feat_per_pseudo_lvl == 8) ? lod_bwd_bwd_input_impl_templated<N_POS_DIMS, 8>
+			: nullptr;
+	if(!fn) {
+		throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]");
 	}
+	fn(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); 
 }
 
 template <typename INPUT_T, typename COMPUTE_T, uint32_t N_POS_DIMS, uint32_t N_FEAT_PER_PSEUDO_LVL>
@@ -1800,16 +1851,12 @@ inline void lod_get_grid_index_dispatched(
 	at::Tensor grid_inds
 ) {
 	const uint32_t batch_size = input.size(0);
-	// static constexpr uint32_t n_threads = 512;
-	static constexpr uint32_t n_threads = 128;
-	const dim3 blocks_lod = { div_round_up(batch_size, n_threads), lod_meta.n_pseudo_levels, 1 };
+	const dim3 blocks_lod = { div_round_up(batch_size, N_THREADS), lod_meta.n_pseudo_levels, 1 };
 	const at::cuda::OptionalCUDAGuard device_guard(at::device_of(input));
 	cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-	kernel_lod_get_grid_index<INPUT_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL><<<blocks_lod, n_threads, 0, stream>>>(
+	kernel_lod_get_grid_index<INPUT_T, COMPUTE_T, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL><<<blocks_lod, N_THREADS, 0, stream>>>(
 		batch_size, 
-		lod_meta.n_encoded_dims, 
-		lod_meta.n_levels, 
 		{lod_meta}, 
 		max_level, (int32_t*)nullptr, 
 		data_ptr<INPUT_T>(input), 
@@ -1830,13 +1877,13 @@ inline void lod_get_grid_index_templated(
 	int32_t max_level, 
 	at::Tensor grid_inds
 ) {
-	if (input.scalar_type() == at::kHalf) {
-		lod_get_grid_index_dispatched<__half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds);
-	} else if (input.scalar_type() == at::kFloat) {
-		lod_get_grid_index_dispatched<float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds);
-	} else {
+	auto fn = (input.scalar_type() == at::kHalf) ? lod_get_grid_index_dispatched<__half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: (input.scalar_type() == at::kFloat) ? lod_get_grid_index_dispatched<float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>
+			: nullptr; 
+	if(!fn) {
 		throw std::runtime_error("LoTDEncoding: Input type not supported. Supported types are: float, half");
 	}
+	fn(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); 
 }
 
 template <uint32_t N_POS_DIMS>
@@ -1849,160 +1896,28 @@ void lod_get_grid_index_impl(
 	int32_t max_level, 
 	at::Tensor grid_inds
 ) {
-	switch (lod_meta.n_feat_per_pseudo_lvl) {
-		case 2: lod_get_grid_index_templated<N_POS_DIMS, 2>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
-		case 4: lod_get_grid_index_templated<N_POS_DIMS, 4>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
-		case 8: lod_get_grid_index_templated<N_POS_DIMS, 8>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
-		default: throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]"); break;
+	auto fn = (lod_meta.n_feat_per_pseudo_lvl == 2) ? lod_get_grid_index_templated<N_POS_DIMS, 2>
+			: (lod_meta.n_feat_per_pseudo_lvl == 4) ? lod_get_grid_index_templated<N_POS_DIMS, 4>
+			: (lod_meta.n_feat_per_pseudo_lvl == 8) ? lod_get_grid_index_templated<N_POS_DIMS, 8>
+			: nullptr; 
+	if(!fn) {
+		throw std::runtime_error("LoTDEncoding: `n_feat_per_pseudo_lvl` must be one of [2,4,8]");
 	}
+	fn(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); 
 }
 
-// 2D instantiation
-extern template void lod_fwd_impl<2>(
-	LoDMeta& lod_meta,
-	at::Tensor input,
-	at::Tensor params,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size, 
-	int32_t max_level, 
-	bool need_input_grad, 
-	at::Tensor output, 
-	at::Tensor dy_dx
-);
+// Template instantiations (to allow for compiling seperate files in parallel)
+extern template void lod_fwd_impl<2>(LoDMeta&,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t, int32_t, bool, at::Tensor, at::Tensor);
+extern template void lod_fwd_impl<3>(LoDMeta&,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t, int32_t, bool, at::Tensor, at::Tensor);
+extern template void lod_fwd_impl<4>(LoDMeta&,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t, int32_t, bool, at::Tensor, at::Tensor);
 
-extern template void lod_bwd_impl<2>(
-	LoDMeta& lod_meta, 
-	at::Tensor dL_dy, 
-	at::Tensor input, 
-	at::Tensor params, 
-	at::optional<at::Tensor> dy_dx_,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size,
-	int32_t max_level, 
-	bool need_input_grad,
-	bool need_param_grad, 
-	at::Tensor dL_dx,
-	at::Tensor dL_dparam
-);
+extern template void lod_bwd_impl<2>(LoDMeta&,at::Tensor,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t,int32_t, bool,bool, at::Tensor,at::Tensor);
+extern template void lod_bwd_impl<3>(LoDMeta&,at::Tensor,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t,int32_t, bool,bool, at::Tensor,at::Tensor);
+extern template void lod_bwd_impl<4>(LoDMeta&,at::Tensor,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t,int32_t, bool,bool, at::Tensor,at::Tensor);
 
-extern template void lod_bwd_bwd_input_impl<2>(
-	LoDMeta& lod_meta, 
-	at::Tensor dL_ddLdx,
-	at::Tensor dL_dy, 
-	at::Tensor input, 
-	at::Tensor params, 
-	at::optional<at::Tensor> dy_dx_,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size,
-	int32_t max_level, 
-	bool need_dLdy_grad, 
-	bool need_input_grad,
-	bool need_param_grad, 
-	at::Tensor dL_ddLdy, 
-	at::Tensor dL_dx, 
-	at::Tensor dL_dparams
-);
-
-// 3D instantiation
-extern template void lod_fwd_impl<3>(
-	LoDMeta& lod_meta,
-	at::Tensor input,
-	at::Tensor params,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size, 
-	int32_t max_level, 
-	bool need_input_grad, 
-	at::Tensor output, 
-	at::Tensor dy_dx
-);
-
-extern template void lod_bwd_impl<3>(
-	LoDMeta& lod_meta, 
-	at::Tensor dL_dy, 
-	at::Tensor input, 
-	at::Tensor params, 
-	at::optional<at::Tensor> dy_dx_,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size,
-	int32_t max_level, 
-	bool need_input_grad,
-	bool need_param_grad, 
-	at::Tensor dL_dx,
-	at::Tensor dL_dparam
-);
-
-extern template void lod_bwd_bwd_input_impl<3>(
-	LoDMeta& lod_meta, 
-	at::Tensor dL_ddLdx,
-	at::Tensor dL_dy, 
-	at::Tensor input, 
-	at::Tensor params, 
-	at::optional<at::Tensor> dy_dx_,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size,
-	int32_t max_level, 
-	bool need_dLdy_grad, 
-	bool need_input_grad,
-	bool need_param_grad, 
-	at::Tensor dL_ddLdy, 
-	at::Tensor dL_dx, 
-	at::Tensor dL_dparams
-);
-
-// 4D instantiation
-extern template void lod_fwd_impl<4>(
-	LoDMeta& lod_meta,
-	at::Tensor input,
-	at::Tensor params,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size, 
-	int32_t max_level, 
-	bool need_input_grad, 
-	at::Tensor output, 
-	at::Tensor dy_dx
-);
-
-extern template void lod_bwd_impl<4>(
-	LoDMeta& lod_meta, 
-	at::Tensor dL_dy, 
-	at::Tensor input, 
-	at::Tensor params, 
-	at::optional<at::Tensor> dy_dx_,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size,
-	int32_t max_level, 
-	bool need_input_grad,
-	bool need_param_grad, 
-	at::Tensor dL_dx,
-	at::Tensor dL_dparam
-);
-
-extern template void lod_bwd_bwd_input_impl<4>(
-	LoDMeta& lod_meta, 
-	at::Tensor dL_ddLdx,
-	at::Tensor dL_dy, 
-	at::Tensor input, 
-	at::Tensor params, 
-	at::optional<at::Tensor> dy_dx_,
-	at::optional<at::Tensor> batch_inds_,
-	at::optional<at::Tensor> batch_offsets_,
-	uint32_t batch_data_size,
-	int32_t max_level, 
-	bool need_dLdy_grad, 
-	bool need_input_grad,
-	bool need_param_grad, 
-	at::Tensor dL_ddLdy, 
-	at::Tensor dL_dx, 
-	at::Tensor dL_dparams
-);
+extern template void lod_bwd_bwd_input_impl<2>(LoDMeta&,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t,int32_t,bool,bool,bool,at::Tensor,at::Tensor,at::Tensor);
+extern template void lod_bwd_bwd_input_impl<3>(LoDMeta&,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t,int32_t,bool,bool,bool,at::Tensor,at::Tensor,at::Tensor);
+extern template void lod_bwd_bwd_input_impl<4>(LoDMeta&,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::optional<at::Tensor>,at::optional<at::Tensor>,at::optional<at::Tensor>,uint32_t,int32_t,bool,bool,bool,at::Tensor,at::Tensor,at::Tensor);
 
 } // namespace lotd::torch
 

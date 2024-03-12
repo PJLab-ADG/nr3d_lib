@@ -9,3 +9,6 @@ dist/
 *.egg-info/
 *.egg
 backups/
+
+nr3d_lib/bindings/
+**/internal/

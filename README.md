@@ -13,7 +13,8 @@ Feel free to open an issue or contact [Jianfei Guo](https://ventusff.github.io/)
 ### Requirements
 
 - python >= 3.8
-- Pytorch >= 1.10 && !=1.12 && <2.0
+- Pytorch >= 1.10 && !=1.12 &&
+  - also works for pytorch >= 2.
 - [CUDA dev](https://developer.nvidia.com/cuda-toolkit-archive) >= 10.0
   - need to match the major CUDA version that your Pytorch built with
 
@@ -34,42 +35,37 @@ conda install pytorch-scatter -c pyg
 - other pip packages
 
 ```shell
-pip install opencv-python-headless kornia imagesize omegaconf addict imageio imageio-ffmpeg scikit-image scikit-learn pyyaml pynvml psutil seaborn==0.12.0 trimesh plyfile ninja icecream tqdm plyfile tensorboard
-```
+pip install opencv-python-headless kornia imagesize omegaconf addict \
+  imageio imageio-ffmpeg scikit-image scikit-learn pyyaml pynvml psutil \
+  seaborn==0.12.0 trimesh plyfile ninja icecream tqdm plyfile tensorboard \
+  torchmetrics
+``` 
 
 ### One-liner install
 
-Clone with submodules:
-```shell
-git clone https://github.com/PJLab-ADG/nr3d_lib --recurse-submodules
-# or
-# git clone git@github.com:PJLab-ADG/nr3d_lib.git --recurse-submodules
-```
-
-`cd` to the `nr3d_lib` directory.
-
-Then: (Notice the trailing dot `.`)
+`cd` to the `nr3d_lib` directory, and then: (Notice the trailing dot `.`)
 
 ```shell
 pip install -v .
+```
+
+:pushpin: NOTE: For pytorch>=2.2, c++17 standard is required --- in this case, you can run 
+
+```shell
+USE_CPP17=1 pip install -v .
 ```
 
 <details>
 <summary>Optional functionalities</summary>
 
 - Visualization
-
-
   - `pip install open3d vedo==2023.4.6 mayavi`
-
 - tiny-cuda-nn backends
-
-
   - `pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch`
+  or
+  - `pip install git+https://github.com/PJLab-ADG/NeuS2_TCNN/#subdirectory=bindings/torch` which supports double-backward of fused_mlp (still buggy)
 
 - GUI support (Experimental)
-
-
   - ```shell
     # opengl
     pip install pyopengl
@@ -99,22 +95,18 @@ pip install -v .
 
 ### :pushpin: [LoTD]: Levels of Tensorial Decomposition <a name="lotd"></a>
 
-- Code: [models/grids/lotd](models/grids/lotd)
+- Code: [models/grids/lotd](nr3d_lib/models/grids/lotd)
 - Supported scenes: 
-
   - [x] Single scene
-
-  - [x] Batched / categorical scene;  (LoTD-Growers to be released in Aug. 2023)
-
-  - [ ] Large-scale scene (To be released: Sept. 2023)
+  - [x] Batched / categorical scene;
+  - [x] Large-scale scene
 - Main feature
-
   - Support **different layer using different types**
   - Support different layer using **different widths (n_feats)**
   - All types support **cuboid resolutions**
   - All types support forward, first-order gradients and **second-order gradients**
   - All types support **batched encoding**: inference with batched inputs or batch_inds
-  - [To be released] All types support large-scale scene representation
+  - All types support large-scale scene representation
 - Supported LoTD Types and calculations of forward, gradients (`dLd[]`) and second-order gradients (`d(dLdx)d[]`)
 
 | :rocket: All implemented with Pytorch-CUDA extension         | dimension | forward            | dL<br />dparam     | dL<br />dx         | d(dLdx)<br />d(param) | d(dLdx)<br />d(dLdy) | d(dLdx)<br />dx    |
@@ -160,21 +152,21 @@ This part is primarily borrowed and modified from [nerfacc](https://github.com/K
 
 - [x] Support single scene
 - [x] Support batched / categorical scene
-- [ ] Support large-scale scene (To be released: Sept. 2023)
+- [x] Support large-scale scene
 
 
 #### Highlight implementations
 
 - Efficient multi-stage hierarchical ray marching on occupancy grids
   - introduced in [StreetSurf](https://ventusff.github.io/streetsurf_web/) paper section 4.1![multi_stage_upsample_occ](media/multi_stage_upsample_occ.png)
-  - implementation in [models/fields/neus/renderer_mixin.py](models/fields/neus/renderer_mixin.py)
-  - batched implementation in [models/fields_conditional/neus/renderer_mixin.py](models/fields_conditional/neus/renderer_mixin.py)
+  - implementation in [models/fields/neus/renderer_mixin.py](nr3d_lib/models/fields/neus/renderer_mixin.py)
+  - batched implementation in [models/fields_conditional/neus/renderer_mixin.py](nr3d_lib/models/fields_conditional/neus/renderer_mixin.py)
   - large-scale implementation is still WIP...
   
 
 ### :pushpin: [attributes]: Unified API framework for scene node attributes <a name="attr"></a>
 
-Code: [models/attributes](models/attributes)
+Code: [models/attributes](nr3d_lib/models/attributes)
 
 We extend `pytorch.Tensor` to represent common types of data involved in 3D neural rendering, e.g. transforms (SO3, SE3) and camera models (pinhole, OpenCV, fisheye), in order to eliminate concerns for tensor shapes, different variants and gradients and only expose common APIs regardless of the underlying implementation.
 
@@ -191,56 +183,59 @@ Most of the basic `pytorch.Tensor` operations are implemented for `Attr` and `At
 
 #### `fields`: single scene
 
-Code: [models/fields](models/fields)
+Code: [models/fields](nr3d_lib/models/fields)
 
 - `sdf`
-
-  - LoTD-SDF
-
-  - MLP-SDF
+  - LoTD encoding [[lotd_sdf.py]](nr3d_lib/models/fields/sdf/lotd_sdf.py)
+  - Permuto encoding [[permuto_sdf.py]](nr3d_lib/models/fields/sdf/permuto_sdf.py)
+  - Basic MLP [[mlp_sdf.py]](nr3d_lib/models/fields/sdf/mlp_sdf.py)
 
 - `neus`
+  - LoTD encoding [[lotd_neus.py]](nr3d_lib/models/fields/neus/lotd_neus.py)
+  - Permuto encoding [[permuto_neus.py]](nr3d_lib/models/fields/neus/permuto_neus.py)
+  - Basic MLP [[mlp_neus.py]](nr3d_lib/models/fields/neus/mlp_neus.py)
+  - [models/fields/neus/renderer_mixin.py](nr3d_lib/models/fields/neus/renderer_mixin.py) Multi-stage hierarchical sampling on occupancy grids
 
-  - LoTD-NeuS
+- `nerf`:
+  - EmerNeRF [[emernerf.py]](nr3d_lib/models/fields_dynamic/nerf/emernerf.py)
+  - LoTD encoding [[lotd_nerf.py]](nr3d_lib/models/fields/nerf/lotd_nerf.py)
+  - Basic MLP [[mlp_nerf.py]](nr3d_lib/models/fields/nerf/mlp_nerf.py)
+  - NeRF++ (codes in [models/fields_distant](nr3d_lib/models/fields_distant))
 
-  - MLP-NeuS
+#### `fields_conditional`: conditional / categorical / generative fields
 
-  - [models/fields/neus/renderer_mixin.py](models/fields/neus/renderer_mixin.py) Multi-stage hierarchical sampling on occupancy grids
+Code: [models/fields_conditional](nr3d_lib/models/fields_conditional)
 
-- `nerf` & `nerf_distant` (codes in [models/fields_distant](models/fields_distant))
-- LoTD-NeRF/NeRF++
-  
-- MLP-NeRF/NeRF++
+- `neus`:
+  - Generative permuto encoding [[generative_permuto_neus.py]](nr3d_lib/models/fields_conditional/neus/generative_permuto_neus.py)
+  - Hypernetwork thats grows LoTD encoding [[style_lotd_neus.py]](nr3d_lib/models/fields_conditional/neus/style_lotd_neus.py)
 
-#### `fields_conditional`: conditional / categorical fields
+#### `fields_forest`: large-scale multi-continuous-block fields
 
-Code: [models/fields_conditional](models/fields_conditional)
+Code: [models/fields_forest](nr3d_lib/models/fields_forest)
 
-- [ ] To be released
-
-#### `fields_forest`: large-scale fields
-
-Code: [models/fields_forest](models/fields_forest)
-
-- [ ] To be released
+- `neus`:
+  - Multi-continuous-block (aka. Forest) NeuS [[lotd_forest_neus.py]](nr3d_lib/models/fields_forest/neus/lotd_forest_neus.py) 
+- `sdf`:
+  - Multi-continuous-block (aka. Forest) SDF [[lotd_forest_sdf.py]](nr3d_lib/models/fields_forest/sdf/lotd_forest_sdf.py)
 
 ### Other highlights
 
 - [plot](plot)  2d & 3d plotting tools for developers
-- [models/importance.py](models/importance.py)  errormap update & 2D importance sampling (inverse 2D cdf sampling);  modified from [NGP](https://github.com/NVlabs/instant-ngp) and re-implemented in PyTorch 
+- [models/importance.py](nr3d_lib/models/importance.py)  errormap update & 2D importance sampling (inverse 2D cdf sampling);  modified from [NGP](https://github.com/NVlabs/instant-ngp) and re-implemented in PyTorch 
+  - An example tensorboard errormap entry at the middle of training: (from top to bottom: GT image, predicated image, accumulated errormap)</br> <img src="media/errormap%400.5x.jpg" alt="errormap" width=600 />
 
 ## TODO
 
 - [x] Release batched ray marching
-- [ ] Release LoTD-Growers and Style-LoTD-NeuS
-- [ ] Release large-scale representation, large-scale ray marching and large-scale neus
+- [x] Release LoTD-Growers and Style-LoTD-NeuS
+- [x] Release large-scale representation, large-scale ray marching and large-scale neus
 - [ ] Implement dmtet
-- [ ] Implement permuto-SDF
+- [x] Implement permuto-SDF
 - [ ] Basic examples & tutorials
   - [ ] How to use single / batched / large-scale LoTD
   - [ ] Example on batched ray marching & batched LoTD inference
   - [ ] Example on efficient multi-stage hierarchical sampling based on occupancy grids
-
 
 ## Acknowledgements
 

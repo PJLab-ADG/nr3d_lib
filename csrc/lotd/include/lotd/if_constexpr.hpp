@@ -1,6 +1,7 @@
 /**
  * @file if_constexpr
  * @brief An `if constexpr` alternative for c++11/c++14 before c++17
+ *        This is necessary since c++17 is only supported for CUDA>=11.0
  * https://github.com/Garcia6l20/if_constexpr14
  * https://stackoverflow.com/questions/43587405/constexpr-if-alternative
  */

@@ -1,0 +1,6 @@
+[submodule "externals/cub"]
+	path = externals/cub
+	url = git@github.com:NVIDIA/cub.git
+[submodule "externals/glm"]
+	path = externals/glm
+	url = git@github.com:g-truc/glm.git

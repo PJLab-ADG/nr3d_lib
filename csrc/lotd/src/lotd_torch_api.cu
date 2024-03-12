@@ -17,9 +17,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
 
-#include <lotd/lotd.h>
+#include <lotd/lotd_cuda.h>
 #include <lotd/lotd_torch_api.h>
 #include <lotd/lotd_encoding.h>
+#include <lotd/lotd_hash_only.h>
+#include <lotd/lotd_forest.h>
 
 namespace lotd {
 namespace torch {
@@ -51,7 +53,7 @@ void LoDMeta::create_meta(
 	}
 
 	level_res.resize(n_levels);
-	level_res_multi_dim.resize(n_levels);
+	level_res_multidim.resize(n_levels);
 	level_n_feats.resize(n_levels);
 	level_types.resize(n_levels);
 	level_n_params.resize(n_levels);
@@ -75,9 +77,14 @@ void LoDMeta::create_meta(
 	uint32_t max_params = std::numeric_limits<uint32_t>::max()/2;
 	uint32_t accumulated_num_params = 0;
 	float accumulated_num_params_float = 0.0f;
+	c_hash_only = true; 
 	for (uint32_t lvl = 0; lvl < n_levels; ++lvl ) {
 		const uint32_t n_feat = lod_n_feats[lvl];
 		const LoDType lod_type = string_to_lod_type(lod_str_types[lvl]);
+
+		if (lod_type != LoDType::Dense && lod_type != LoDType::Hash) {
+			c_hash_only = false; 
+		}
 		
 		level_n_feats[lvl] = (uint32_t)n_feat;
 		level_types[lvl] = (uint32_t)lod_type;
@@ -89,7 +96,7 @@ void LoDMeta::create_meta(
 		std::vector<uint32_t> resolution(n_dims_to_encode);
 		bool equal_res = true; 
 		for (uint32_t dim=0; dim < n_dims_to_encode; ++dim) {
-		 	resolution[dim] = lod_res_multidim[lvl][dim];
+			resolution[dim] = lod_res_multidim[lvl][dim];
 			if (resolution[dim] <= 2) {
 				throw std::runtime_error("LoTDEncoding: only support grid resolutions >= 3");
 			}
@@ -97,7 +104,7 @@ void LoDMeta::create_meta(
 				equal_res = false;
 			}
 		}
-		level_res_multi_dim[lvl] = resolution;
+		level_res_multidim[lvl] = resolution;
 		if (equal_res) {
 			level_res[lvl] = resolution[0];
 		} else {
@@ -224,6 +231,7 @@ void LoDMeta::create_meta(
 
 std::tuple<at::Tensor, at::Tensor> lod_fwd_common(
 	LoDMeta lod_meta,
+	at::optional<ForestMeta> forest_meta_,
 	at::Tensor input,
 	at::Tensor params,
 	// Optional
@@ -282,23 +290,94 @@ std::tuple<at::Tensor, at::Tensor> lod_fwd_common(
 	}
 
 	bool need_input_grad = need_input_grad_.value_or(input.requires_grad());
+
+	if (max_level <= -1) return {
+		at::zeros({ batch_size, lod_meta.n_encoded_dims}, params.options()),
+		at::zeros( {batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode}, input.options())
+	};
+
+	at::Tensor output;
 	at::Tensor dy_dx;
-	if (need_input_grad) {
-		dy_dx = at::zeros( {batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode}, input.options());
-	}
+	if (!forest_meta_.has_value()) {
+		if (lod_meta.c_hash_only) {
+			output = at::zeros({lod_meta.n_encoded_dims, batch_size}, params.options());
+			if (need_input_grad) {
+				if (lod_meta.c_permute_dydx)
+					dy_dx = at::zeros({lod_meta.n_encoded_dims, batch_size, lod_meta.n_dims_to_encode}, input.options());
+				else
+					dy_dx = at::zeros({batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode}, input.options());
+			}
+			switch (lod_meta.n_dims_to_encode) {
+				// case 1: lod_fwd_impl<1>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				case 2: lod_hash_only_fwd_impl<2>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				case 3: lod_hash_only_fwd_impl<3>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				case 4: lod_hash_only_fwd_impl<4>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				default: throw std::runtime_error("LoTDEncoding::fwd: `n_dims_to_encode` must be 2 or 3."); break;
+			}
+			output = output.t();
+			if (need_input_grad && lod_meta.c_permute_dydx)
+				dy_dx = dy_dx.permute({1, 0, 2});
+		} else {
+			output = at::zeros({batch_size, lod_meta.n_encoded_dims}, params.options());
+			if (need_input_grad)
+				dy_dx = at::zeros({batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode}, input.options());
+			switch (lod_meta.n_dims_to_encode) {
+				// case 1: lod_fwd_impl<1>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				case 2: lod_fwd_impl<2>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				case 3: lod_fwd_impl<3>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				case 4: lod_fwd_impl<4>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
+				default: throw std::runtime_error("LoTDEncoding::fwd: `n_dims_to_encode` must be 2 or 3."); break;
+			}
+		}
+	} else {
+		ForestMeta& forest = forest_meta_.value();
 
-	at::Tensor output = at::zeros({ batch_size, lod_meta.n_encoded_dims}, params.options());
-	if (max_level <= -1) return {output, dy_dx};
+		// Check forest args 
+		at::TensorArg octree_arg(forest.octree, "forest.octree", 0);
+		at::TensorArg exsum_arg(forest.exsum, "forest.exsum", 0);
+		at::TensorArg block_ks_arg(forest.block_ks, "forest.block_ks", 0);
 
-	switch (lod_meta.n_dims_to_encode) {
-		// case 1: lod_fwd_impl<1>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
-		case 2: lod_fwd_impl<2>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
-		case 3: lod_fwd_impl<3>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
-		case 4: lod_fwd_impl<4>(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx); break;
-		default: throw std::runtime_error("LoTDEncoding::fwd: `n_dims_to_encode` must be 2 or 3."); break;
+		at::checkDim(__func__, octree_arg, 1);
+		at::checkDim(__func__, exsum_arg, 1);
+		at::checkSize(__func__, block_ks_arg, {forest.n_trees, lod_meta.n_dims_to_encode});
+		at::checkAllSameGPU(__func__, {input_arg, octree_arg, exsum_arg, block_ks_arg});
+		at::checkAllContiguous(__func__, {octree_arg, exsum_arg, block_ks_arg});
+		at::checkScalarType(__func__, octree_arg, at::kByte);
+		at::checkScalarType(__func__, exsum_arg, at::kInt);
+		at::checkScalarType(__func__, block_ks_arg, at::kShort);
+
+		if (batch_offsets_.has_value()) {
+			at::TensorArg batch_offset_arg(batch_offset, "batch_offset", 4);
+			at::checkSize(__func__, batch_offset_arg, {forest.n_trees});
+		}
+
+		if (batch_data_size_.has_value()) {
+
+		}
+		
+		if (lod_meta.n_dims_to_encode != 3) {
+			throw std::runtime_error("LoTDEncoding::fwd: lotd-forest only supports `n_dims_to_encode`==3");
+		}
+		lod_forest_fwd_impl<3>(lod_meta, forest, input, params, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, output, dy_dx);
 	}
 
 	return {output, dy_dx};
+}
+
+std::tuple<at::Tensor, at::Tensor> lod_forest_fwd(
+	std::tuple<LoDMeta, ForestMeta> metas,
+	at::Tensor input,
+	at::Tensor params,
+	// Optional
+	at::optional<at::Tensor> batch_inds_,
+	at::optional<at::Tensor> batch_offsets_,
+	at::optional<uint32_t> batch_data_size_, 
+	at::optional<int32_t> max_level_, 
+	at::optional<bool> need_input_grad_
+) {
+	LoDMeta& lod_meta = std::get<0>(metas);
+	ForestMeta& forest_meta = std::get<1>(metas);
+	return lod_fwd_common(lod_meta, forest_meta, input, params, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_);
 }
 
 std::tuple<at::Tensor, at::Tensor> lod_fwd(
@@ -312,27 +391,12 @@ std::tuple<at::Tensor, at::Tensor> lod_fwd(
 	at::optional<int32_t> max_level_, 
 	at::optional<bool> need_input_grad_
 ) {
-	return lod_fwd_common(lod_meta, input, params, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_);
+	return lod_fwd_common(lod_meta, at::nullopt, input, params, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_);
 }
-
-// std::tuple<at::Tensor, at::Tensor> lod_forest_fwd(
-// 	std::tuple<LoDMeta, ForestMeta> metas,
-// 	at::Tensor input,
-// 	at::Tensor params,
-// 	// Optional
-// 	at::optional<at::Tensor> batch_inds_,
-// 	at::optional<at::Tensor> batch_offsets_,
-// 	at::optional<uint32_t> batch_data_size_, 
-// 	at::optional<int32_t> max_level_, 
-// 	at::optional<bool> need_input_grad_
-// ) {
-// 	LoDMeta& lod_meta = std::get<0>(metas);
-// 	ForestMeta& forest_meta = std::get<1>(metas);
-// 	return lod_fwd_common(lod_meta, forest_meta, input, params, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_);
-// }
 
 std::tuple<at::Tensor, at::Tensor> lod_bwd_common(
 	LoDMeta lod_meta,
+	at::optional<ForestMeta> forest_meta_,
 	at::Tensor dL_dy,
 	at::Tensor input,
 	at::Tensor params,
@@ -353,7 +417,7 @@ std::tuple<at::Tensor, at::Tensor> lod_bwd_common(
 	at::checkDim(__func__, input_arg, 2);
 	at::checkDim(__func__, params_arg, 1);
 	at::checkAllSameGPU(__func__, {input_arg, params_arg, dL_dy_arg});
-	at::checkAllContiguous(__func__, {input_arg, params_arg, dL_dy_arg});
+	at::checkAllContiguous(__func__, {input_arg, params_arg});
 	at::checkScalarTypes(__func__, dL_dy_arg, {at::kHalf, at::kFloat});
 	at::checkScalarTypes(__func__, input_arg, {at::kHalf, at::kFloat});
 	at::checkScalarTypes(__func__, params_arg, {at::kHalf, at::kFloat});
@@ -373,12 +437,12 @@ std::tuple<at::Tensor, at::Tensor> lod_bwd_common(
 	if (dy_dx_.has_value()) {
 		dy_dx = dy_dx_.value();
 		at::TensorArg dy_dx_arg(dy_dx, "dy_dx", 4);
-		at::checkDim(__func__, dy_dx_arg, 2);
+		// at::checkDim(__func__, dy_dx_arg, 2);
 		at::checkSameGPU(__func__, input_arg, dy_dx_arg);
-		at::checkContiguous(__func__, dy_dx_arg);
+		// at::checkContiguous(__func__, dy_dx_arg);
 		at::checkScalarTypes(__func__, dy_dx_arg, {at::kHalf, at::kFloat});
 		at::checkSameType(__func__, input_arg, dy_dx_arg);
-		at::checkSize(__func__, dy_dx_arg, {batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode });
+		// at::checkSize(__func__, dy_dx_arg, {batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode });
 	}
 
 	at::Tensor batch_inds;
@@ -428,16 +492,68 @@ std::tuple<at::Tensor, at::Tensor> lod_bwd_common(
 	if (max_level <= -1) return {dL_dx, dL_dparam};
 
 	if (need_input_grad || need_param_grad) {
-		switch (lod_meta.n_dims_to_encode) {
-			// case 1: lod_bwd_impl<1>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
-			case 2: lod_bwd_impl<2>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
-			case 3: lod_bwd_impl<3>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
-			case 4: lod_bwd_impl<4>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
-			default: throw std::runtime_error("LoTDEncoding::bwd: `n_dims_to_encode` must be 2 or 3."); break;
+		if (!forest_meta_.has_value()) {
+			if (lod_meta.c_hash_only) {
+				auto fn = lod_meta.n_dims_to_encode == 2 ? lod_hash_only_bwd_impl<2>
+						: lod_meta.n_dims_to_encode == 3 ? lod_hash_only_bwd_impl<3>
+						: lod_meta.n_dims_to_encode == 4 ? lod_hash_only_bwd_impl<4>
+						: nullptr;
+				if (!fn)
+					throw std::runtime_error("LoTDEncoding::bwd: `n_dims_to_encode` must be 2 or 3.");
+				std::tie(dL_dx, dL_dparam) = fn(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam);
+			} else {
+				switch (lod_meta.n_dims_to_encode) {
+					// case 1: lod_bwd_impl<1>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
+					case 2: lod_bwd_impl<2>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
+					case 3: lod_bwd_impl<3>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
+					case 4: lod_bwd_impl<4>(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); break;
+					default: throw std::runtime_error("LoTDEncoding::bwd: `n_dims_to_encode` must be 2 or 3."); break;
+				}
+			}
+		} else {
+			ForestMeta& forest = forest_meta_.value();
+
+			// Check forest args
+			at::TensorArg octree_arg(forest.octree, "forest.octree", 0);
+			at::TensorArg exsum_arg(forest.exsum, "forest.exsum", 0);
+			at::TensorArg block_ks_arg(forest.block_ks, "forest.block_ks", 0);
+
+			at::checkDim(__func__, octree_arg, 1);
+			at::checkDim(__func__, exsum_arg, 1);
+			at::checkSize(__func__, block_ks_arg, {forest.n_trees, lod_meta.n_dims_to_encode});
+			at::checkAllSameGPU(__func__, {input_arg, octree_arg, exsum_arg, block_ks_arg});
+			at::checkAllContiguous(__func__, {octree_arg, exsum_arg, block_ks_arg});
+			at::checkScalarType(__func__, octree_arg, at::kByte);
+			at::checkScalarType(__func__, exsum_arg, at::kInt);
+			at::checkScalarType(__func__, block_ks_arg, at::kShort);
+			
+			if (lod_meta.n_dims_to_encode != 3) {
+				throw std::runtime_error("LoTDEncoding::fwd: lotd-forest only supports `n_dims_to_encode`==3");
+			}
+			lod_forest_bwd_impl<3>(lod_meta, forest, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_input_grad, need_param_grad, dL_dx, dL_dparam); 
 		}
 	}
 	return {dL_dx, dL_dparam};
 } 
+
+std::tuple<at::Tensor, at::Tensor> lod_forest_bwd(
+	std::tuple<LoDMeta, ForestMeta> metas,
+	at::Tensor dL_dy,
+	at::Tensor input,
+	at::Tensor params,
+	// Optional
+	at::optional<at::Tensor> dy_dx_, // Needed when `need_input_grad`
+	at::optional<at::Tensor> batch_inds_,
+	at::optional<at::Tensor> batch_offsets_,
+	at::optional<uint32_t> batch_data_size_, 
+	at::optional<int32_t> max_level_, 
+	at::optional<bool> need_input_grad_, 
+	at::optional<bool> need_param_grad_
+) {
+	LoDMeta& lod_meta = std::get<0>(metas);
+	ForestMeta& forest_meta = std::get<1>(metas);
+	return lod_bwd_common(lod_meta, forest_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_, need_param_grad_);
+}
 
 std::tuple<at::Tensor, at::Tensor> lod_bwd(
 	LoDMeta lod_meta,
@@ -453,30 +569,12 @@ std::tuple<at::Tensor, at::Tensor> lod_bwd(
 	at::optional<bool> need_input_grad_, 
 	at::optional<bool> need_param_grad_
 ) {
-	return lod_bwd_common(lod_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_, need_param_grad_);
+	return lod_bwd_common(lod_meta, at::nullopt, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_, need_param_grad_);
 }
-
-// std::tuple<at::Tensor, at::Tensor> lod_forest_bwd(
-// 	std::tuple<LoDMeta, ForestMeta> metas,
-// 	at::Tensor dL_dy,
-// 	at::Tensor input,
-// 	at::Tensor params,
-// 	// Optional
-// 	at::optional<at::Tensor> dy_dx_, // Needed when `need_input_grad`
-// 	at::optional<at::Tensor> batch_inds_,
-// 	at::optional<at::Tensor> batch_offsets_,
-// 	at::optional<uint32_t> batch_data_size_, 
-// 	at::optional<int32_t> max_level_, 
-// 	at::optional<bool> need_input_grad_, 
-// 	at::optional<bool> need_param_grad_
-// ) {
-// 	LoDMeta& lod_meta = std::get<0>(metas);
-// 	ForestMeta& forest_meta = std::get<1>(metas);
-// 	return lod_bwd_common(lod_meta, forest_meta, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_input_grad_, need_param_grad_);
-// }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> lod_bwd_bwd_input_common(
 	LoDMeta lod_meta,
+	at::optional<ForestMeta> forest_meta_,
 	at::Tensor dL_ddLdx,
 	at::Tensor dL_dy,
 	at::Tensor input,
@@ -501,7 +599,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> lod_bwd_bwd_input_common(
 	at::checkDim(__func__, input_arg, 2);
 	at::checkDim(__func__, params_arg, 1);
 	at::checkAllSameGPU(__func__, {input_arg, params_arg, dL_dy_arg, dL_ddLdx_arg});
-	at::checkAllContiguous(__func__, {input_arg, params_arg, dL_dy_arg, dL_ddLdx_arg});
+	at::checkAllContiguous(__func__, {input_arg, params_arg, dL_ddLdx_arg});
 	at::checkScalarTypes(__func__, dL_ddLdx_arg, {at::kHalf, at::kFloat});
 	at::checkScalarTypes(__func__, dL_dy_arg, {at::kHalf, at::kFloat});
 	at::checkScalarTypes(__func__, input_arg, {at::kHalf, at::kFloat});
@@ -524,12 +622,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> lod_bwd_bwd_input_common(
 	if (dy_dx_.has_value()) {
 		dy_dx = dy_dx_.value();
 		at::TensorArg dy_dx_arg(dy_dx, "dy_dx", 5);
-		at::checkDim(__func__, dy_dx_arg, 2);
+		// at::checkDim(__func__, dy_dx_arg, 2);
 		at::checkSameGPU(__func__, input_arg, dy_dx_arg);
-		at::checkContiguous(__func__, dy_dx_arg);
+		// at::checkContiguous(__func__, dy_dx_arg);
 		at::checkScalarTypes(__func__, dy_dx_arg, {at::kHalf, at::kFloat});
 		at::checkSameType(__func__, input_arg, dy_dx_arg);
-		at::checkSize(__func__, dy_dx_arg, {batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode });
+		// at::checkSize(__func__, dy_dx_arg, {batch_size, lod_meta.n_encoded_dims * lod_meta.n_dims_to_encode });
 	}
 
 	at::Tensor batch_inds;
@@ -585,12 +683,45 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> lod_bwd_bwd_input_common(
 	if (max_level <= -1) return {dL_ddLdy, dL_dparams, dL_dx};
 
 	if (need_dLdy_grad || need_input_grad || need_param_grad) {
-		switch (lod_meta.n_dims_to_encode) {
-			// case 1: lod_bwd_bwd_input_impl<1>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
-			case 2: lod_bwd_bwd_input_impl<2>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
-			case 3: lod_bwd_bwd_input_impl<3>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
-			case 4: lod_bwd_bwd_input_impl<4>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
-			default: throw std::runtime_error("LoTDEncoding::bwd_bwd_input: `n_dims_to_encode` must be 2 or 3."); break;
+		if (!forest_meta_.has_value()) {
+			if (lod_meta.c_hash_only) {
+				switch (lod_meta.n_dims_to_encode) {
+					// case 1: lod_hash_only_bwd_bwd_input_impl<1>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					case 2: lod_hash_only_bwd_bwd_input_impl<2>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					case 3: lod_hash_only_bwd_bwd_input_impl<3>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					case 4: lod_hash_only_bwd_bwd_input_impl<4>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					default: throw std::runtime_error("LoTDEncoding::bwd_bwd_input: `n_dims_to_encode` must be 2 or 3."); break;
+				}
+			} else {
+				switch (lod_meta.n_dims_to_encode) {
+					// case 1: lod_bwd_bwd_input_impl<1>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					case 2: lod_bwd_bwd_input_impl<2>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					case 3: lod_bwd_bwd_input_impl<3>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					case 4: lod_bwd_bwd_input_impl<4>(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams); break;
+					default: throw std::runtime_error("LoTDEncoding::bwd_bwd_input: `n_dims_to_encode` must be 2 or 3."); break;
+				}
+			}
+		} else {
+			ForestMeta& forest = forest_meta_.value();
+
+			// Check forest args
+			at::TensorArg octree_arg(forest.octree, "forest.octree", 0);
+			at::TensorArg exsum_arg(forest.exsum, "forest.exsum", 0);
+			at::TensorArg block_ks_arg(forest.block_ks, "forest.block_ks", 0);
+
+			at::checkDim(__func__, octree_arg, 1);
+			at::checkDim(__func__, exsum_arg, 1);
+			at::checkSize(__func__, block_ks_arg, {forest.n_trees, lod_meta.n_dims_to_encode});
+			at::checkAllSameGPU(__func__, {input_arg, octree_arg, exsum_arg, block_ks_arg});
+			at::checkAllContiguous(__func__, {octree_arg, exsum_arg, block_ks_arg});
+			at::checkScalarType(__func__, octree_arg, at::kByte);
+			at::checkScalarType(__func__, exsum_arg, at::kInt);
+			at::checkScalarType(__func__, block_ks_arg, at::kShort);
+			
+			if (lod_meta.n_dims_to_encode != 3) {
+				throw std::runtime_error("LoTDEncoding::fwd: lotd-forest only supports `n_dims_to_encode`==3");
+			}
+			lod_forest_bwd_bwd_input_impl<3>(lod_meta, forest, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dLdy_grad, need_input_grad, need_param_grad, dL_ddLdy, dL_dx, dL_dparams);
 		}
 	}
 
@@ -613,11 +744,33 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> lod_bwd_bwd_input(
 	at::optional<bool> need_dLdinput_dparams_,
 	at::optional<bool> need_dLdinput_dinput_
 ) {
-	return lod_bwd_bwd_input_common(lod_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_dLdinput_ddLdoutput_, need_dLdinput_dparams_, need_dLdinput_dinput_);
+	return lod_bwd_bwd_input_common(lod_meta, at::nullopt, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_dLdinput_ddLdoutput_, need_dLdinput_dparams_, need_dLdinput_dinput_);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> lod_forest_bwd_bwd_input(
+	std::tuple<LoDMeta, ForestMeta> metas,
+	at::Tensor dL_ddLdx,
+	at::Tensor dL_dy,
+	at::Tensor input,
+	at::Tensor params,
+	// Optional
+	at::optional<at::Tensor> dy_dx_, // Needed when `need_dLdy_grad`
+	at::optional<at::Tensor> batch_inds_,
+	at::optional<at::Tensor> batch_offsets_,
+	at::optional<uint32_t> batch_data_size_,
+	at::optional<int32_t> max_level_, 
+	at::optional<bool> need_dLdinput_ddLdoutput_,
+	at::optional<bool> need_dLdinput_dparams_,
+	at::optional<bool> need_dLdinput_dinput_
+) {
+	LoDMeta &lod_meta = std::get<0>(metas);
+	ForestMeta &forest_meta = std::get<1>(metas);
+	return lod_bwd_bwd_input_common(lod_meta, forest_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_dLdinput_ddLdoutput_, need_dLdinput_dparams_, need_dLdinput_dinput_);
 }
 
 at::Tensor lod_get_grid_index_common(
 	LoDMeta lod_meta,
+	at::optional<ForestMeta> forest_meta_,
 	at::Tensor input,
 	// Optional
 	at::optional<at::Tensor> batch_inds_,
@@ -675,36 +828,19 @@ at::Tensor lod_get_grid_index_common(
 	at::Tensor grid_inds = at::zeros({ batch_size, lod_meta.n_encoded_dims, (1<<lod_meta.n_dims_to_encode)}, input.options().dtype(at::kLong));
 	if (max_level <= -1) return grid_inds;
 
-	switch (lod_meta.n_dims_to_encode) {
-		// case 1: lod_get_grid_index_impl<1>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
-		case 2: lod_get_grid_index_impl<2>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
-		case 3: lod_get_grid_index_impl<3>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
-		case 4: lod_get_grid_index_impl<4>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
-		default: throw std::runtime_error("LoTDEncoding::get_grid_index: `n_dims_to_encode` must be 2 or 3."); break;
+	if (!forest_meta_.has_value()) {
+		switch (lod_meta.n_dims_to_encode) {
+			// case 1: lod_get_grid_index_impl<1>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
+			case 2: lod_get_grid_index_impl<2>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
+			case 3: lod_get_grid_index_impl<3>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
+			case 4: lod_get_grid_index_impl<4>(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size, max_level, grid_inds); break;
+			default: throw std::runtime_error("LoTDEncoding::get_grid_index: `n_dims_to_encode` must be 2 or 3."); break;
+		}
+	} else {
+		throw std::runtime_error("LoTDEncoding::lod_get_grid_index: Not implemented for forest for now"); 
 	}
 	return grid_inds;
 }
-
-// std::tuple<at::Tensor, at::Tensor, at::Tensor> lod_forest_bwd_bwd_input(
-// 	std::tuple<LoDMeta, ForestMeta> metas,
-// 	at::Tensor dL_ddLdx,
-// 	at::Tensor dL_dy,
-// 	at::Tensor input,
-// 	at::Tensor params,
-// 	// Optional
-// 	at::optional<at::Tensor> dy_dx_, // Needed when `need_dLdy_grad`
-// 	at::optional<at::Tensor> batch_inds_,
-// 	at::optional<at::Tensor> batch_offsets_,
-// 	at::optional<uint32_t> batch_data_size_,
-// 	at::optional<int32_t> max_level_, 
-// 	at::optional<bool> need_dLdinput_ddLdoutput_,
-// 	at::optional<bool> need_dLdinput_dparams_,
-// 	at::optional<bool> need_dLdinput_dinput_
-// ) {
-// 	LoDMeta &lod_meta = std::get<0>(metas);
-// 	ForestMeta &forest_meta = std::get<1>(metas);
-// 	return lod_bwd_bwd_input_common(lod_meta, forest_meta, dL_ddLdx, dL_dy, input, params, dy_dx_, batch_inds_, batch_offsets_, batch_data_size_, max_level_, need_dLdinput_ddLdoutput_, need_dLdinput_dparams_, need_dLdinput_dinput_);
-// }
 
 at::Tensor lod_get_grid_index(
 	LoDMeta lod_meta,
@@ -715,10 +851,22 @@ at::Tensor lod_get_grid_index(
 	at::optional<uint32_t> batch_data_size_,
 	at::optional<int32_t> max_level_
 ) {
-	return lod_get_grid_index_common(lod_meta, input, batch_inds_, batch_offsets_, batch_data_size_, max_level_);
+	return lod_get_grid_index_common(lod_meta, at::nullopt, input, batch_inds_, batch_offsets_, batch_data_size_, max_level_);
+}
+
+at::Tensor lod_forest_get_grid_index(
+	std::tuple<LoDMeta, ForestMeta> metas,
+	at::Tensor input,
+	// Optional
+	at::optional<at::Tensor> batch_inds_,
+	at::optional<at::Tensor> batch_offsets_,
+	at::optional<uint32_t> batch_data_size_,
+	at::optional<int32_t> max_level_
+) {
+	LoDMeta &lod_meta = std::get<0>(metas);
+	ForestMeta &forest_meta = std::get<1>(metas);
+	return lod_get_grid_index_common(lod_meta, forest_meta, input, batch_inds_, batch_offsets_, batch_data_size_, max_level_);
 }
 
 } // namespace lotd::torch
-
 } // namespace lotd
-

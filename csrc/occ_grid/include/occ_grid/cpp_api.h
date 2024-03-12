@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <torch/torch.h>
 
-// #include <forest_cpp_api.h>
+#include <forest_cpp_api.h>
 
 enum ContractionType
 {
@@ -48,19 +48,19 @@ std::vector<at::Tensor> batched_ray_marching(
     const uint32_t max_steps,
     const bool return_gidx);
 
-// std::vector<at::Tensor> forest_ray_marching(
-//     const ForestMeta& forest,
-//     const at::Tensor rays_o,
-//     const at::Tensor rays_d,
-//     const at::Tensor t_min, 
-//     const at::Tensor t_max,
-//     const at::Tensor seg_block_inds,
-//     const at::Tensor seg_entries,
-//     const at::Tensor seg_exits,
-//     const at::Tensor seg_pack_infos,
-//     const at::Tensor grid_binary,
-//     const float step_size,
-//     const float max_step_size, 
-//     const float dt_gamma, 
-//     const uint32_t max_steps,
-//     const bool return_gidx);
+std::vector<at::Tensor> forest_ray_marching(
+    const ForestMeta& forest,
+    const at::Tensor rays_o,
+    const at::Tensor rays_d,
+    const at::Tensor t_min, 
+    const at::Tensor t_max,
+    const at::Tensor seg_block_inds,
+    const at::Tensor seg_entries,
+    const at::Tensor seg_exits,
+    const at::Tensor seg_pack_infos,
+    const at::Tensor grid_binary,
+    const float step_size,
+    const float max_step_size, 
+    const float dt_gamma, 
+    const uint32_t max_steps,
+    const bool return_gidx);
