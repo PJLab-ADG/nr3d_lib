@@ -240,7 +240,6 @@ kernel_permutohedral(
 	//  (where rank describes what position coordinate i has in the sorted order of the features values)
 	#pragma unroll
 	for (uint32_t dim=0; dim<N_POS_DIMS; ++dim) {
-		int32_t rank0 = rank[dim]; 
 		COMPUTE_T di = elevated[dim] - (COMPUTE_T)rem0[dim]; // \vec{\Delta} = \vec{x}-\vec{\nu}_0
 		for (uint32_t other_dim=dim+1; other_dim<=N_POS_DIMS; ++other_dim) {
 			if (di < elevated[other_dim] - (COMPUTE_T)rem0[other_dim]) {
@@ -460,7 +459,6 @@ kernel_permutohedral_backward_lattice(
 	//  (where rank describes what position coordinate i has in the sorted order of the features values)
 	#pragma unroll
 	for (uint32_t dim=0; dim<N_POS_DIMS; ++dim) {
-		int32_t rank0 = rank[dim]; 
 		COMPUTE_T di = elevated[dim] - (COMPUTE_T)rem0[dim]; // \vec{\Delta} = \vec{x}-\vec{\nu}_0
 		for (uint32_t other_dim=dim+1; other_dim<=N_POS_DIMS; ++other_dim) {
 			if (di < elevated[other_dim] - (COMPUTE_T)rem0[other_dim]) {
@@ -681,7 +679,6 @@ kernel_permutohedral_backward_input(
 	//  (where rank describes what position coordinate i has in the sorted order of the features values)
 	#pragma unroll
 	for (uint32_t dim=0; dim<N_POS_DIMS; ++dim) {
-		int32_t rank0 = rank[dim]; 
 		COMPUTE_T di = elevated[dim] - (COMPUTE_T)rem0[dim]; // \vec{\Delta} = \vec{x}-\vec{\nu}_0
 		for (uint32_t other_dim=dim+1; other_dim<=N_POS_DIMS; ++other_dim) {
 			if (di < elevated[other_dim] - (COMPUTE_T)rem0[other_dim]) {
@@ -911,7 +908,6 @@ kernel_permutohedral_backward_backward_input(
 	//  (where rank describes what position coordinate i has in the sorted order of the features values)
 	#pragma unroll
 	for (uint32_t dim=0; dim<N_POS_DIMS; ++dim) {
-		int32_t rank0 = rank[dim]; 
 		COMPUTE_T di = elevated[dim] - (COMPUTE_T)rem0[dim]; // \vec{\Delta} = \vec{x}-\vec{\nu}_0
 		for (uint32_t other_dim=dim+1; other_dim<=N_POS_DIMS; ++other_dim) {
 			if (di < elevated[other_dim] - (COMPUTE_T)rem0[other_dim]) {
