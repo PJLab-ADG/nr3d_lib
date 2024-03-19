@@ -816,7 +816,7 @@ setup(
     maintainer="Jianfei Guo",
     maintainer_email="ffventus@gmail.com",
     download_url=f"https://github.com/PJLAB-ADG/nr3d_lib",
-    # license="BSD 3-Clause \"New\" or \"Revised\" License",
+    license="MIT",
     packages=find_packages(),
     install_requires=["ninja"],
     include_package_data=True,
